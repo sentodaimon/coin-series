@@ -1,11 +1,11 @@
 @echo off
 rem ===== Coin Series MAINNET settings =====
 set DATA=C:\CoinSeries\mainnet
-rem Announced Bitcoin block H (height). The start script waits for it and reads its header itself.
+rem Bitcoin block H (fixed start reference of the mainnet). Do not change.
 set HEIGHT=974800
-rem Verified claim snapshot (already checked on the testnet)
+rem Claim snapshot utxo-840000.dat (about 9.8 GB, see README "Windows quick start")
 set SNAPSHOT=C:\CoinSeries\snapshot\utxo-840000.dat
-rem Another mainnet node to connect to (empty = none)
-set SEED=
-rem Mining threads (default: all CPU threads)
+rem Public node to connect to (each chain uses its own port)
+set SEED=coinseries.duckdns.org
+rem Mining threads (default: all CPU threads; lower it if the PC gets too hot or slow)
 set THREADS=%NUMBER_OF_PROCESSORS%

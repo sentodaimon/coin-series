@@ -1,4 +1,5 @@
-﻿# Waits for Bitcoin block H, reads its 80-byte header from two public explorers, starts the mainnet.
+﻿# Reads the 80-byte header of Bitcoin block H from two public explorers, checks it, starts the five
+# mainnet nodes, waits until they are synced with the network, then starts mining.
 param([switch]$DryRun)
 Set-Location $PSScriptRoot
 $s = @{}; Get-Content .\m0-settings.bat | Where-Object { $_ -match '^set (\w+)=(.*)$' } | ForEach-Object { $null = $_ -match '^set (\w+)=(.*)$'; $s[$Matches[1]] = $Matches[2].Trim() }
@@ -23,7 +24,12 @@ function SHA256d-Hex($hex) {
   $sha = [Security.Cryptography.SHA256]::Create(); $d = $sha.ComputeHash($sha.ComputeHash($b)); [Array]::Reverse($d)
   -join ($d | ForEach-Object { $_.ToString('x2') })
 }
-Log "waiting for Bitcoin block $H"
+if (-not (Test-Path $s.SNAPSHOT)) {
+  Log "The claim snapshot is missing: $($s.SNAPSHOT)"
+  Log "Download utxo-840000.dat (about 9.8 GB) and put it there, then run this again. See README (Windows quick start)."
+  exit 1
+}
+Log "reading Bitcoin block $H"
 while ($true) {
   $r = Get-Header $H
   if ($r) {
@@ -34,12 +40,6 @@ while ($true) {
 }
 Log "block H found: $($r.hash) from $($r.src)"
 Set-Content (Join-Path $DATA "beacon-header.txt") $r.header
-if (-not $DryRun) {
-# Free the CPU: stop testnet mining and nodes.
-Stop-Process -Name cs-miner -Force -ErrorAction SilentlyContinue
-foreach ($c in "half","quarter","dime","nickel","cent") { & .\bitcoin-cli.exe "-datadir=C:\CoinSeries\testnet7b" -chain=test "-coin=$c" stop 2>$null | Out-Null }
-Start-Sleep 15
-}
 $args0 = @("-datadir=$DATA", "-chain=main", "-beaconheader=$($r.header)", "-claimsnapshot=$($s.SNAPSHOT)")
 if ($s.SEED) { $args0 += "-addnode=$($s.SEED)" }
 foreach ($c in "half","quarter","dime","nickel","cent") {
@@ -48,7 +48,7 @@ foreach ($c in "half","quarter","dime","nickel","cent") {
 Log "nodes started, waiting until ready"
 $addr = @{}
 foreach ($c in "half","quarter","dime","nickel","cent") {
-  for ($i = 0; $i -lt 120; $i++) { $n = & .\bitcoin-cli.exe "-datadir=$DATA" -chain=main "-coin=$c" getblockcount 2>$null; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep 5 }
+  for ($i = 0; $i -lt 360; $i++) { $n = & .\bitcoin-cli.exe "-datadir=$DATA" -chain=main "-coin=$c" getblockcount 2>$null; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep 5 }
   & .\bitcoin-cli.exe "-datadir=$DATA" -chain=main "-coin=$c" createwallet w 2>$null | Out-Null
   & .\bitcoin-cli.exe "-datadir=$DATA" -chain=main "-coin=$c" loadwallet w 2>$null | Out-Null
   $f = Join-Path $DATA "address-$c.txt"
@@ -60,6 +60,24 @@ if ($DryRun) {
   Log "DRY RUN OK - stopping dry-run nodes (no mining)"
   foreach ($c in "half","quarter","dime","nickel","cent") { & .\bitcoin-cli.exe "-datadir=$DATA" -chain=main "-coin=$c" stop 2>$null | Out-Null }
   exit 0
+}
+# Wait until the nodes are connected and synced, so mining builds on the current chain.
+if ($s.SEED) {
+  Log "connecting to $($s.SEED) and downloading the chain (can take a few minutes)"
+  $ok = $false
+  for ($i = 0; $i -lt 360; $i++) {
+    $all = $true
+    foreach ($c in "half","quarter","dime","nickel","cent") {
+      $raw = & .\bitcoin-cli.exe "-datadir=$DATA" -chain=main "-coin=$c" getblockchaininfo 2>$null
+      $info = if ($raw) { ($raw -join "`n") | ConvertFrom-Json } else { $null }
+      $peers = [int](& .\bitcoin-cli.exe "-datadir=$DATA" -chain=main "-coin=$c" getconnectioncount 2>$null)
+      if (-not $info -or $peers -lt 1 -or $info.headers -lt 1 -or $info.blocks -lt $info.headers) { $all = $false }
+    }
+    if ($all) { $ok = $true; break }
+    Start-Sleep 10
+  }
+  if ($ok) { $n = & .\bitcoin-cli.exe "-datadir=$DATA" -chain=main -coin=half getblockcount; Log "synced: $n blocks" }
+  else { Log "WARNING: could not sync with $($s.SEED) within 60 minutes. Check the internet connection; mining starts anyway." }
 }
 $minerArgs = @("--chain","main","--datadir",$DATA,"--threads",$THREADS)
 foreach ($c in "half","quarter","dime","nickel","cent") { $minerArgs += @("--coin", "$c=$($addr[$c])") }
