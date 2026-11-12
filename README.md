@@ -29,7 +29,7 @@ Public node (all five chains on one host):
 | Nickel | `coinseries.duckdns.org:21320` |
 | Cent | `coinseries.duckdns.org:21400` |
 
-- Windows kit: before running `m1-start-mainnet.bat`, set `SEED=coinseries.duckdns.org` in `m0-settings.bat`. Each chain then connects on its own port.
+- Windows kit: `m0-settings.bat` already has `SEED=coinseries.duckdns.org`; each chain connects on its own port.
 - A node that is already running: `bitcoin-cli -datadir=C:\CoinSeries\mainnet -chain=main -coin=half addnode coinseries.duckdns.org:21302 add` (repeat for each coin with its port).
 - If you can, open the same TCP ports on your own router so that others can connect to you too.
 
@@ -74,11 +74,18 @@ Sento Daimon (pen name). The issuer mines like everyone else; its mining reward 
 
 ## Windows quick start
 
-1. Put `utxo-840000.dat` (Bitcoin Core assumeutxo snapshot of block 840,000, about 9.8 GB) in `C:\CoinSeries\snapshot\` (or edit `SNAPSHOT` in `m0-settings.bat`).
-2. In `m0-settings.bat`, set `SEED=coinseries.duckdns.org`.
-3. Run `m1-start-mainnet.bat`. It checks the header of Bitcoin block 974800, starts the five nodes, syncs and mines with all CPU threads.
+1. Download this repository (Code -> Download ZIP) and copy its `windows` folder to `C:\CoinSeries\` (any folder works).
+2. Download the claim snapshot `utxo-840000.dat` (Bitcoin Core UTXO snapshot of block 840,000, about 9.8 GB) and put it in `C:\CoinSeries\snapshot\`.
+   - Torrent: `magnet:?xt=urn:btih:596c26cc709e213fdfec997183ff67067241440c&dn=utxo-840000.dat&tr=udp%3A%2F%2Ftracker.bitcoin.sprovoost.nl%3A6969`
+   - Or direct download: `https://lopp.net/download/utxo-snapshot-height-840000.dat` (rename it to `utxo-840000.dat`).
+   - The source does not matter: the node computes the snapshot's UTXO hash and starts only if it equals the value fixed in Bitcoin Core (`a2a5521b…8f96`).
+   - Or extract it yourself from a synced Bitcoin Core node: `bitcoin-cli -rpcclienttimeout=0 -named dumptxoutset utxo-840000.dat rollback=840000`.
+3. Run `m1-start-mainnet.bat`. It checks the header of Bitcoin block 974800, starts the five nodes, connects to `coinseries.duckdns.org` (set in `m0-settings.bat`), waits until the chain is downloaded and starts mining with all CPU threads. The first start verifies the snapshot and takes a few minutes.
 4. After it has started, run `m2-protect-wallets.bat` to set a wallet password and save backups.
 5. `m3-status.bat` shows heights, connections and balances; `m4-stop-mainnet.bat` stops everything.
+6. Optional: open TCP ports 21302, 21304, 21310, 21320 and 21400 on your router so that other nodes can connect to you.
+
+Mining rewards can be spent after 100 blocks (about 17 hours).
 
 Windows SmartScreen may warn because the files are not code-signed: "More info" -> "Run anyway".
 Do not click inside the black node windows (it pauses them; press Esc to resume).
