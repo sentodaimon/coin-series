@@ -1,4 +1,4 @@
-# Bitcoin Coin Series — mainnet launch announcement
+# Bitcoin Coin Series — mainnet running
 
 Unofficial experimental project, not affiliated with Bitcoin or Bitcoin Core. No sale, no premine, no developer allocation. Coins have no promised value.
 
@@ -11,6 +11,27 @@ Five independent chains with Bitcoin's transaction system and a supply multiplie
 | Bitcoin Dime | BTCD | 10 |
 | Bitcoin Nickel | BTCN | 20 |
 | Bitcoin Cent | BTCC | 100 |
+
+## Mainnet status
+
+- Launched 2026-11-06. Bitcoin block 974800 (hash `00000000000000000000604cc2a86a91a1cb07c387f57f70efbc4a861a74dd23`) was found at 10:25 UTC; the first Coin Series blocks followed at 10:33 UTC.
+- Anyone can join and mine. There is no permission, registration or fee.
+
+## Join the network
+
+Public node (all five chains on one host):
+
+| Coin | Address |
+| --- | --- |
+| Half | `coinseries.duckdns.org:21302` |
+| Quarter | `coinseries.duckdns.org:21304` |
+| Dime | `coinseries.duckdns.org:21310` |
+| Nickel | `coinseries.duckdns.org:21320` |
+| Cent | `coinseries.duckdns.org:21400` |
+
+- Windows kit: before running `m1-start-mainnet.bat`, set `SEED=coinseries.duckdns.org` in `m0-settings.bat`. Each chain then connects on its own port.
+- A node that is already running: `bitcoin-cli -datadir=C:\CoinSeries\mainnet -chain=main -coin=half addnode coinseries.duckdns.org:21302 add` (repeat for each coin with its port).
+- If you can, open the same TCP ports on your own router so that others can connect to you too.
 
 ## Fair start
 
@@ -39,14 +60,25 @@ Bitcoin Core v31.1 plus patches `patches/0001` … `0011` applied in order, with
 - Claim snapshot (Bitcoin Core `utxo-840000.dat`, hash a2a5521b…8f96) verified by the node.
 - Second-node sync, claim lookup and claim rejection without proof tested.
 
-Issuer: Sento Daimon (pen name). The issuer's mining reward addresses will be published after launch.
+## Issuer
+
+Sento Daimon (pen name). The issuer mines like everyone else; its mining reward addresses:
+
+| Coin | Address |
+| --- | --- |
+| Half | `hf1qehjpwg78vpeenph2c007up5jletumup5cja4rd` |
+| Quarter | `qt1q9g0yvmdm5nppuxdnu3432enscgmkd80355h3tm` |
+| Dime | `dm1qls7vqs4vd3l46245yrcak36xt5qfzqd50z8wst` |
+| Nickel | `nk1qjhuh7pus4anfd7k40lpdf9q8znjykdc5rs4vry` |
+| Cent | `ct1qq7stl076rkh9ayp5lk58cratx4xf9gyvu8n06l` |
 
 ## Windows quick start
 
 1. Put `utxo-840000.dat` (Bitcoin Core assumeutxo snapshot of block 840,000, about 9.8 GB) in `C:\CoinSeries\snapshot\` (or edit `SNAPSHOT` in `m0-settings.bat`).
-2. Run `m1-start-mainnet.bat`. It waits for Bitcoin block 974800, checks its header, starts the five nodes and mines with all CPU threads.
-3. After it has started, run `m2-protect-wallets.bat` to set a wallet password and save backups.
-4. `m3-status.bat` shows heights, connections and balances; `m4-stop-mainnet.bat` stops everything.
+2. In `m0-settings.bat`, set `SEED=coinseries.duckdns.org`.
+3. Run `m1-start-mainnet.bat`. It checks the header of Bitcoin block 974800, starts the five nodes, syncs and mines with all CPU threads.
+4. After it has started, run `m2-protect-wallets.bat` to set a wallet password and save backups.
+5. `m3-status.bat` shows heights, connections and balances; `m4-stop-mainnet.bat` stops everything.
 
 Windows SmartScreen may warn because the files are not code-signed: "More info" -> "Run anyway".
 Do not click inside the black node windows (it pauses them; press Esc to resume).
