@@ -1,0 +1,772 @@
+From 562de985cbb7a721683eb932d087ed163b254ee2 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <339524263+sentodaimon@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 17:09:50 +0900
+Subject: [PATCH] Coin Series stage 1: five coin chain parameters, reward
+ schedule, per-chain money limit
+
+- -coin=half|quarter|dime|nickel|cent combined with -chain=main|test|regtest
+- per coin/environment: network magic, ports, data directory, address prefixes,
+  merge slot, signature chain id, development placeholder genesis
+- block reward: new-chain height h rewarded as Bitcoin height 840000+h, times multiplier
+- money limit: 21 million x multiplier per chain (Bitcoin unchanged)
+- unit tests (coinseries_tests) and five-coin regtest smoke test
+---
+ contrib/coinseries/regtest_smoke.sh |  50 ++++++++
+ src/chainparams.cpp                 |   8 ++
+ src/chainparamsbase.cpp             |  25 +++-
+ src/chainparamsbase.h               |   5 +
+ src/consensus/amount.h              |   8 +-
+ src/consensus/params.h              |   8 ++
+ src/kernel/chainparams.cpp          | 153 ++++++++++++++++++++++
+ src/kernel/chainparams.h            |   3 +
+ src/kernel/coinseries.h             | 100 +++++++++++++++
+ src/test/CMakeLists.txt             |   1 +
+ src/test/coinseries_tests.cpp       | 191 ++++++++++++++++++++++++++++
+ src/validation.cpp                  |  10 +-
+ 12 files changed, 558 insertions(+), 4 deletions(-)
+ create mode 100755 contrib/coinseries/regtest_smoke.sh
+ create mode 100644 src/kernel/coinseries.h
+ create mode 100644 src/test/coinseries_tests.cpp
+
+diff --git a/contrib/coinseries/regtest_smoke.sh b/contrib/coinseries/regtest_smoke.sh
+new file mode 100755
+index 0000000..4e545f0
+--- /dev/null
++++ b/contrib/coinseries/regtest_smoke.sh
+@@ -0,0 +1,50 @@
++#!/usr/bin/env bash
++# Coin Series regtest smoke test: for each coin, start a node, mine, check reward and addresses, send a transaction.
++# Usage: contrib/coinseries/regtest_smoke.sh <build/bin directory>
++set -euo pipefail
++BIN=${1:-build/bin}
++WORK=$(mktemp -d)
++trap 'for c in half quarter dime nickel cent; do "$BIN/bitcoin-cli" -datadir="$WORK" -coin=$c -regtest stop >/dev/null 2>&1 || true; done; sleep 2; rm -rf "$WORK"' EXIT
++
++declare -A MULT=([half]=2 [quarter]=4 [dime]=10 [nickel]=20 [cent]=100)
++declare -A HRP=([half]=rhf [quarter]=rqt [dime]=rdm [nickel]=rnk [cent]=rct)
++FAIL=0
++
++# Start all five nodes at once to prove they coexist (separate ports and data directories).
++for c in half quarter dime nickel cent; do
++  "$BIN/bitcoind" -datadir="$WORK" -coin=$c -regtest -daemon -fallbackfee=0.0001 -listen=1 >/dev/null
++done
++sleep 6
++
++for c in half quarter dime nickel cent; do
++  CLI=("$BIN/bitcoin-cli" -datadir="$WORK" -coin=$c -regtest)
++  "${CLI[@]}" -rpcwait createwallet w >/dev/null
++  ADDR=$("${CLI[@]}" getnewaddress)
++  "${CLI[@]}" generatetoaddress 101 "$ADDR" >/dev/null
++  BAL=$("${CLI[@]}" getbalance)
++  EXPECT=$(python3 -c "print(f'{3.125*${MULT[$c]}:.8f}')")
++  INFO=$("${CLI[@]}" getblockchaininfo)
++  CHAIN=$(echo "$INFO" | python3 -c "import sys,json;print(json.load(sys.stdin)['chain'])")
++  DEST=$("${CLI[@]}" getnewaddress "" bech32)
++  LEGACY=$("${CLI[@]}" getnewaddress "" legacy)
++  TXID=$("${CLI[@]}" sendtoaddress "$DEST" 1)
++  "${CLI[@]}" generatetoaddress 1 "$ADDR" >/dev/null
++  CONF=$("${CLI[@]}" gettransaction "$TXID" | python3 -c "import sys,json;print(json.load(sys.stdin)['confirmations'])")
++  PORT=$("${CLI[@]}" getnetworkinfo | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['localaddresses'][0]['port'] if d['localaddresses'] else '-')")
++  OK=yes
++  [[ "$BAL" == "$EXPECT" ]] || OK=no
++  [[ "$ADDR" == ${HRP[$c]}1* ]] || OK=no
++  [[ "$CONF" == "1" ]] || OK=no
++  printf "%-8s chain=%-8s matured_reward=%-14s expected=%-14s bech32=%s... legacy=%s... tx_confirmed=%s  %s\n" \
++    "$c" "$CHAIN" "$BAL" "$EXPECT" "${ADDR:0:8}" "${LEGACY:0:4}" "$CONF" "$([[ $OK == yes ]] && echo PASS || echo FAIL)"
++  [[ $OK == yes ]] || FAIL=1
++done
++
++# A bech32 address of one coin must be rejected by another coin's node.
++HALF_ADDR=$("$BIN/bitcoin-cli" -datadir="$WORK" -coin=half -regtest getnewaddress)
++if "$BIN/bitcoin-cli" -datadir="$WORK" -coin=cent -regtest validateaddress "$HALF_ADDR" | grep -q '"isvalid": false'; then
++  echo "cross-chain address rejected: PASS"
++else
++  echo "cross-chain address rejected: FAIL"; FAIL=1
++fi
++exit $FAIL
+diff --git a/src/chainparams.cpp b/src/chainparams.cpp
+index 32c3bff..93e21b0 100644
+--- a/src/chainparams.cpp
++++ b/src/chainparams.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <chainparamsbase.h>
+ #include <common/args.h>
++#include <consensus/amount.h>
+ #include <consensus/params.h>
+ #include <deploymentinfo.h>
+ #include <logging.h>
+@@ -116,6 +117,11 @@ const CChainParams &Params() {
+ 
+ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, const ChainType chain)
+ {
++    if (const CoinSeriesId coin = GetCoinArg(args); coin != CoinSeriesId::NONE) {
++        auto opts = CChainParams::RegTestOptions{};
++        if (chain == ChainType::REGTEST) ReadRegTestArgs(args, opts);
++        return CChainParams::CoinSeries(coin, chain, opts);
++    }
+     switch (chain) {
+     case ChainType::MAIN:
+         return CChainParams::Main();
+@@ -141,4 +147,6 @@ void SelectParams(const ChainType chain)
+ {
+     SelectBaseParams(chain);
+     globalChainParams = CreateChainParams(gArgs, chain);
++    // Coin Series: per-chain money limit (21 million x multiplier; Bitcoin = 21 million).
++    SetMaxMoneyForMultiplier(globalChainParams->GetConsensus().nSupplyMultiplier);
+ }
+diff --git a/src/chainparamsbase.cpp b/src/chainparamsbase.cpp
+index d816d1a..8062f0d 100644
+--- a/src/chainparamsbase.cpp
++++ b/src/chainparamsbase.cpp
+@@ -10,9 +10,12 @@
+ #include <util/chaintype.h>
+ 
+ #include <cassert>
++#include <stdexcept>
++#include <string>
+ 
+ void SetupChainParamsBaseOptions(ArgsManager& argsman)
+ {
++    argsman.AddArg("-coin=<coin>", "Coin Series: run the chain of <coin>. Allowed values: " LIST_COIN_NAMES ". Combine with -chain=main, test or regtest. Without -coin the software runs original Bitcoin (for regression testing only).", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-chain=<chain>", "Use the chain <chain> (default: main). Allowed values: " LIST_CHAIN_NAMES, ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-regtest", "Enter regression test mode, which uses a special chain in which blocks can be solved instantly. "
+                  "This is intended for regression testing tools and app development. Equivalent to -chain=regtest.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+@@ -54,8 +57,28 @@ std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const ChainType chain)
+     assert(false);
+ }
+ 
++CoinSeriesId GetCoinArg(const ArgsManager& args)
++{
++    const std::string value = args.GetArg("-coin", "");
++    const auto coin = CoinFromString(value);
++    if (!coin) throw std::runtime_error(strprintf("Unknown -coin value '%s'. Allowed values: %s", value, LIST_COIN_NAMES));
++    return *coin;
++}
++
++std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const ChainType chain, const CoinSeriesId coin)
++{
++    if (coin == CoinSeriesId::NONE) return CreateBaseChainParams(chain);
++    const CoinInfo* info = GetCoinInfo(coin);
++    const auto env = CoinEnvFromChainType(chain);
++    if (!info || !env) throw std::runtime_error(strprintf("Coin Series supports only -chain=main, test or regtest (got %s)", ChainTypeToString(chain)));
++    const size_t e = static_cast<size_t>(*env);
++    std::string data_dir{info->name};
++    if (*env != CoinEnv::MAIN) data_dir += "-" + std::string{CoinEnvName(*env)};
++    return std::make_unique<CBaseChainParams>(data_dir, static_cast<uint16_t>(info->rpc_port_main + 10000 * e));
++}
++
+ void SelectBaseParams(const ChainType chain)
+ {
+-    globalChainBaseParams = CreateBaseChainParams(chain);
++    globalChainBaseParams = CreateBaseChainParams(chain, GetCoinArg(gArgs));
+     gArgs.SelectConfigNetwork(ChainTypeToString(chain));
+ }
+diff --git a/src/chainparamsbase.h b/src/chainparamsbase.h
+index 1407f19..516787c 100644
+--- a/src/chainparamsbase.h
++++ b/src/chainparamsbase.h
+@@ -5,6 +5,7 @@
+ #ifndef BITCOIN_CHAINPARAMSBASE_H
+ #define BITCOIN_CHAINPARAMSBASE_H
+ 
++#include <kernel/coinseries.h>
+ #include <util/chaintype.h>
+ 
+ #include <cstdint>
+@@ -36,6 +37,10 @@ private:
+  * Creates and returns a std::unique_ptr<CBaseChainParams> of the chosen chain.
+  */
+ std::unique_ptr<CBaseChainParams> CreateBaseChainParams(ChainType chain);
++/** Coin Series: base params (data directory, RPC port) for a coin. CoinSeriesId::NONE gives original Bitcoin values. */
++std::unique_ptr<CBaseChainParams> CreateBaseChainParams(ChainType chain, CoinSeriesId coin);
++/** Coin Series: read and validate -coin. Throws std::runtime_error on an unknown value. */
++CoinSeriesId GetCoinArg(const ArgsManager& args);
+ 
+ /**
+  *Set the arguments for chainparams
+diff --git a/src/consensus/amount.h b/src/consensus/amount.h
+index 2a65a83..816a9a0 100644
+--- a/src/consensus/amount.h
++++ b/src/consensus/amount.h
+@@ -23,7 +23,13 @@ static constexpr CAmount COIN = 100000000;
+  * critical; in unusual circumstances like a(nother) overflow bug that allowed
+  * for the creation of coins out of thin air modification could lead to a fork.
+  * */
+-static constexpr CAmount MAX_MONEY = 21000000 * COIN;
++// Coin Series: the limit depends on the selected chain (21 million x supply multiplier).
++// It defaults to Bitcoin's value and is set once by SelectParams() before any validation.
++static constexpr CAmount BITCOIN_MAX_MONEY = 21000000 * COIN;
++//! Largest limit of any Coin Series chain (Cent, 100x). Fits comfortably in int64_t.
++static constexpr CAmount COIN_SERIES_MAX_MONEY_CEILING = BITCOIN_MAX_MONEY * 100;
++inline CAmount MAX_MONEY = BITCOIN_MAX_MONEY;
++inline void SetMaxMoneyForMultiplier(int64_t multiplier) { MAX_MONEY = BITCOIN_MAX_MONEY * multiplier; }
+ inline bool MoneyRange(const CAmount& nValue) { return (nValue >= 0 && nValue <= MAX_MONEY); }
+ 
+ #endif // BITCOIN_CONSENSUS_AMOUNT_H
+diff --git a/src/consensus/params.h b/src/consensus/params.h
+index 93ee071..d0ac339 100644
+--- a/src/consensus/params.h
++++ b/src/consensus/params.h
+@@ -84,6 +84,14 @@ struct BIP9Deployment {
+ struct Params {
+     uint256 hashGenesisBlock;
+     int nSubsidyHalvingInterval;
++    /** Coin Series: supply multiplier versus Bitcoin (1 = original Bitcoin) */
++    int64_t nSupplyMultiplier{1};
++    /** Coin Series: Bitcoin height of the snapshot; new-chain height h is rewarded as Bitcoin height nSnapshotHeight + h (0 = original Bitcoin) */
++    int nSnapshotHeight{0};
++    /** Coin Series: merged mining slot 0..4 (-1 = not a Coin Series chain) */
++    int nMergeSlot{-1};
++    /** Coin Series: chain identifier committed in transaction signatures (0 = original Bitcoin) */
++    uint32_t nChainSigId{0};
+     /**
+      * Hashes of blocks that
+      * - are known to be consensus valid, and
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index 64809a7..ce3817e 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -6,11 +6,14 @@
+ #include <kernel/chainparams.h>
+ 
+ #include <chainparamsseeds.h>
++#include <arith_uint256.h>
+ #include <consensus/amount.h>
+ #include <consensus/merkle.h>
+ #include <consensus/params.h>
+ #include <crypto/hex_base.h>
++#include <crypto/sha256.h>
+ #include <hash.h>
++#include <kernel/coinseries.h>
+ #include <kernel/messagestartchars.h>
+ #include <primitives/block.h>
+ #include <primitives/transaction.h>
+@@ -20,6 +23,10 @@
+ #include <util/chaintype.h>
+ #include <util/log.h>
+ #include <util/strencodings.h>
++#include <tinyformat.h>
++
++#include <stdexcept>
++#include <string>
+ 
+ #include <algorithm>
+ #include <array>
+@@ -698,6 +705,152 @@ std::unique_ptr<const CChainParams> CChainParams::RegTest(const RegTestOptions&
+     return std::make_unique<const CRegTestParams>(options);
+ }
+ 
++/**
++ * Coin Series chain parameters (Half, Quarter, Dime, Nickel, Cent).
++ *
++ * Development stage: proof of work is still Bitcoin's SHA256d with placeholder
++ * limits, and the genesis block is a development placeholder. RandomX merged
++ * mining, ASERT difficulty with stall relief, signature chain identifiers,
++ * snapshot claims and the launch-bound genesis are added in later stages.
++ */
++class CCoinSeriesParams : public CChainParams
++{
++public:
++    CCoinSeriesParams(const CoinInfo& info, CoinEnv env, ChainType chain, const RegTestOptions& opts)
++    {
++        const size_t e = static_cast<size_t>(env);
++        m_chain_type = chain;
++
++        consensus.signet_blocks = false;
++        consensus.signet_challenge.clear();
++        consensus.script_flag_exceptions.clear();
++
++        // Supply rules (decided): Bitcoin schedule continued from the snapshot height, times the multiplier.
++        consensus.nSubsidyHalvingInterval = 210000;
++        consensus.nSupplyMultiplier = info.multiplier;
++        consensus.nSnapshotHeight = 840000;
++        consensus.nMergeSlot = info.merge_slot;
++        // Chain identifier for signatures: distinct per coin and environment. Used from the signing stage.
++        consensus.nChainSigId = 0x43530000u | (uint32_t{info.merge_slot} << 8) | uint32_t(e);
++
++        // All of Bitcoin's rules (BIP34/65/66, CSV, SegWit, Taproot) are active from the first block.
++        consensus.BIP34Height = 1;
++        consensus.BIP34Hash = uint256();
++        consensus.BIP65Height = 1;
++        consensus.BIP66Height = 1;
++        consensus.CSVHeight = 1;
++        consensus.SegwitHeight = 0;
++        consensus.MinBIP9WarningHeight = 0;
++
++        consensus.nPowTargetSpacing = 10 * 60;
++        if (env == CoinEnv::REGTEST) {
++            consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
++            consensus.nPowTargetTimespan = 24 * 60 * 60;
++            consensus.fPowAllowMinDifficultyBlocks = true;
++            consensus.fPowNoRetargeting = true;
++            consensus.enforce_BIP94 = opts.enforce_bip94;
++        } else {
++            // Placeholder until the RandomX / ASERT stage replaces proof of work and difficulty.
++            consensus.powLimit = uint256{"00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
++            consensus.nPowTargetTimespan = 14 * 24 * 60 * 60;
++            consensus.fPowAllowMinDifficultyBlocks = (env == CoinEnv::TEST);
++            consensus.fPowNoRetargeting = false;
++            consensus.enforce_BIP94 = (env == CoinEnv::TEST);
++        }
++
++        const int32_t period = env == CoinEnv::REGTEST ? 144 : 2016;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].min_activation_height = 0;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = period * 3 / 4;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period = period;
++
++        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit = 2;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].threshold = period * 3 / 4;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].period = period;
++
++        if (env == CoinEnv::REGTEST) {
++            for (const auto& [dep, height] : opts.activation_heights) {
++                switch (dep) {
++                case Consensus::BuriedDeployment::DEPLOYMENT_SEGWIT: consensus.SegwitHeight = int{height}; break;
++                case Consensus::BuriedDeployment::DEPLOYMENT_HEIGHTINCB: consensus.BIP34Height = int{height}; break;
++                case Consensus::BuriedDeployment::DEPLOYMENT_DERSIG: consensus.BIP66Height = int{height}; break;
++                case Consensus::BuriedDeployment::DEPLOYMENT_CLTV: consensus.BIP65Height = int{height}; break;
++                case Consensus::BuriedDeployment::DEPLOYMENT_CSV: consensus.CSVHeight = int{height}; break;
++                }
++            }
++            for (const auto& [deployment_pos, vbp] : opts.version_bits_parameters) {
++                consensus.vDeployments[deployment_pos].nStartTime = vbp.start_time;
++                consensus.vDeployments[deployment_pos].nTimeout = vbp.timeout;
++                consensus.vDeployments[deployment_pos].min_activation_height = vbp.min_activation_height;
++            }
++        }
++
++        // New chains: no Bitcoin history to trust.
++        consensus.nMinimumChainWork = uint256{};
++        consensus.defaultAssumeValid = uint256{};
++
++        // Network magic: first 4 bytes of SHA256("coin-series/<coin>/<environment>").
++        const std::string magic_tag = strprintf("coin-series/%s/%s", std::string{info.name}, std::string{CoinEnvName(env)});
++        unsigned char digest[CSHA256::OUTPUT_SIZE];
++        CSHA256().Write(reinterpret_cast<const unsigned char*>(magic_tag.data()), magic_tag.size()).Finalize(digest);
++        std::copy(digest, digest + 4, pchMessageStart.begin());
++
++        nDefaultPort = info.p2p_port_main + 10000 * e;
++        nPruneAfterHeight = env == CoinEnv::REGTEST ? (opts.fastprune ? 100 : 1000) : 100000;
++        m_assumed_blockchain_size = 0;
++        m_assumed_chain_state_size = 0;
++
++        // Development placeholder genesis. Replaced at launch by the genesis bound to a future Bitcoin block.
++        const uint32_t genesis_bits = UintToArith256(consensus.powLimit).GetCompact();
++        const std::string genesis_msg = strprintf("Coin Series %s %s development genesis", std::string{info.title}, std::string{CoinEnvName(env)});
++        const CScript genesis_script = CScript() << OP_RETURN;
++        genesis = CreateGenesisBlock(genesis_msg.c_str(), genesis_script, 1790812800, 0, genesis_bits, 1, /*genesisReward=*/0);
++        const arith_uint256 target = arith_uint256().SetCompact(genesis_bits);
++        while (UintToArith256(genesis.GetHash()) > target) ++genesis.nNonce;
++        consensus.hashGenesisBlock = genesis.GetHash();
++
++        vFixedSeeds.clear();
++        vSeeds.clear();
++
++        fDefaultConsistencyChecks = (env == CoinEnv::REGTEST);
++        m_is_mockable_chain = (env == CoinEnv::REGTEST);
++        m_assumeutxo_data.clear();
++        chainTxData = ChainTxData{.nTime = 0, .tx_count = 0, .dTxRate = 0.001};
++
++        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1, info.pubkey_prefix[e]);
++        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1, info.script_prefix[e]);
++        base58Prefixes[SECRET_KEY] = std::vector<unsigned char>(1, info.secret_prefix[e]);
++        if (env == CoinEnv::MAIN) {
++            base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x88, 0xB2, 0x1E};
++            base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x88, 0xAD, 0xE4};
++        } else {
++            base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
++            base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
++        }
++        bech32_hrp = std::string{info.bech32_hrp[e]};
++
++        m_headers_sync_params = HeadersSyncParams{
++            .commitment_period = 275,
++            .redownload_buffer_size = 7017,
++        };
++    }
++};
++
++std::unique_ptr<const CChainParams> CChainParams::CoinSeries(CoinSeriesId coin, ChainType chain, const RegTestOptions& regtest_options)
++{
++    const CoinInfo* info = GetCoinInfo(coin);
++    const auto env = CoinEnvFromChainType(chain);
++    if (!info || !env) {
++        throw std::runtime_error(strprintf("Coin Series supports only -chain=main, test or regtest (got %s)", ChainTypeToString(chain)));
++    }
++    return std::make_unique<const CCoinSeriesParams>(*info, *env, chain, regtest_options);
++}
++
+ std::unique_ptr<const CChainParams> CChainParams::Main()
+ {
+     return std::make_unique<const CMainParams>();
+diff --git a/src/kernel/chainparams.h b/src/kernel/chainparams.h
+index f7209be..25ec78c 100644
+--- a/src/kernel/chainparams.h
++++ b/src/kernel/chainparams.h
+@@ -7,6 +7,7 @@
+ #define BITCOIN_KERNEL_CHAINPARAMS_H
+ 
+ #include <consensus/params.h>
++#include <kernel/coinseries.h>
+ #include <kernel/messagestartchars.h>
+ #include <primitives/block.h>
+ #include <uint256.h>
+@@ -159,6 +160,8 @@ public:
+     static std::unique_ptr<const CChainParams> Main();
+     static std::unique_ptr<const CChainParams> TestNet();
+     static std::unique_ptr<const CChainParams> TestNet4();
++    /** Coin Series chain parameters for one coin and one environment (main / test / regtest). */
++    static std::unique_ptr<const CChainParams> CoinSeries(CoinSeriesId coin, ChainType chain, const RegTestOptions& regtest_options);
+ 
+ protected:
+     CChainParams() = default;
+diff --git a/src/kernel/coinseries.h b/src/kernel/coinseries.h
+new file mode 100644
+index 0000000..0e7574e
+--- /dev/null
++++ b/src/kernel/coinseries.h
+@@ -0,0 +1,100 @@
++// Copyright (c) 2026 Sento Daimon
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_KERNEL_COINSERIES_H
++#define BITCOIN_KERNEL_COINSERIES_H
++
++#include <util/chaintype.h>
++
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++
++/**
++ * Bitcoin Coin Series: five independent chains (Half, Quarter, Dime, Nickel, Cent)
++ * built from one source tree. Selected with -coin=<name>. Without -coin the
++ * software behaves as original Bitcoin Core (kept for regression testing).
++ */
++enum class CoinSeriesId : uint8_t {
++    NONE = 0,
++    HALF,
++    QUARTER,
++    DIME,
++    NICKEL,
++    CENT,
++};
++
++/** Index of the network environment within a coin (main / test / regtest). */
++enum class CoinEnv : uint8_t { MAIN = 0, TEST = 1, REGTEST = 2 };
++
++struct CoinInfo {
++    CoinSeriesId coin;
++    std::string_view name;    //!< value of -coin=
++    std::string_view title;   //!< human readable name
++    std::string_view ticker;
++    int64_t multiplier;       //!< supply multiplier versus Bitcoin
++    uint8_t merge_slot;       //!< merged mining slot 0..4
++    uint16_t p2p_port_main;   //!< test = +10000, regtest = +20000
++    uint16_t rpc_port_main;   //!< test = +10000, regtest = +20000
++    std::array<std::string_view, 3> bech32_hrp;   //!< main, test, regtest
++    std::array<uint8_t, 3> pubkey_prefix;          //!< base58 P2PKH version byte per env
++    std::array<uint8_t, 3> script_prefix;          //!< base58 P2SH version byte per env
++    std::array<uint8_t, 3> secret_prefix;          //!< base58 WIF version byte per env
++};
++
++inline constexpr std::array<CoinInfo, 5> COIN_TABLE{{
++    {CoinSeriesId::HALF,    "half",    "Bitcoin Half",    "BTCH", 2,   0, 38302, 38202, {"hf", "thf", "rhf"}, {40, 130, 140}, {100, 135, 145}, {168, 200, 210}},
++    {CoinSeriesId::QUARTER, "quarter", "Bitcoin Quarter", "BTCQ", 4,   1, 38304, 38204, {"qt", "tqt", "rqt"}, {58, 131, 141}, {120, 136, 146}, {186, 201, 211}},
++    {CoinSeriesId::DIME,    "dime",    "Bitcoin Dime",    "BTCD", 10,  2, 38310, 38210, {"dm", "tdm", "rdm"}, {30, 132, 142}, {90, 137, 147},  {158, 202, 212}},
++    {CoinSeriesId::NICKEL,  "nickel",  "Bitcoin Nickel",  "BTCN", 20,  3, 38320, 38220, {"nk", "tnk", "rnk"}, {53, 133, 143}, {112, 138, 148}, {181, 203, 213}},
++    {CoinSeriesId::CENT,    "cent",    "Bitcoin Cent",    "BTCC", 100, 4, 38400, 38300, {"ct", "tct", "rct"}, {28, 134, 144}, {87, 139, 149},  {156, 204, 214}},
++}};
++
++inline const CoinInfo* GetCoinInfo(CoinSeriesId coin)
++{
++    for (const auto& info : COIN_TABLE) {
++        if (info.coin == coin) return &info;
++    }
++    return nullptr;
++}
++
++/** Parse a -coin= value. Empty string or "bitcoin" means NONE. Returns nullopt if unknown. */
++inline std::optional<CoinSeriesId> CoinFromString(std::string_view name)
++{
++    if (name.empty() || name == "bitcoin") return CoinSeriesId::NONE;
++    for (const auto& info : COIN_TABLE) {
++        if (info.name == name) return info.coin;
++    }
++    return std::nullopt;
++}
++
++/** Map a Bitcoin chain type to a coin environment. Only main, test and regtest are supported. */
++inline std::optional<CoinEnv> CoinEnvFromChainType(ChainType chain)
++{
++    switch (chain) {
++    case ChainType::MAIN: return CoinEnv::MAIN;
++    case ChainType::TESTNET: return CoinEnv::TEST;
++    case ChainType::REGTEST: return CoinEnv::REGTEST;
++    case ChainType::TESTNET4:
++    case ChainType::SIGNET:
++        return std::nullopt;
++    }
++    return std::nullopt;
++}
++
++inline std::string_view CoinEnvName(CoinEnv env)
++{
++    switch (env) {
++    case CoinEnv::MAIN: return "mainnet";
++    case CoinEnv::TEST: return "testnet";
++    case CoinEnv::REGTEST: return "regtest";
++    }
++    return "";
++}
++
++#define LIST_COIN_NAMES "half, quarter, dime, nickel, cent"
++
++#endif // BITCOIN_KERNEL_COINSERIES_H
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 7d9dccb..bf406a2 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -31,6 +31,7 @@ add_executable(test_bitcoin
+   checkqueue_tests.cpp
+   cluster_linearize_tests.cpp
+   coins_tests.cpp
++  coinseries_tests.cpp
+   coinscachepair_tests.cpp
+   coinstatsindex_tests.cpp
+   coinsviewoverlay_tests.cpp
+diff --git a/src/test/coinseries_tests.cpp b/src/test/coinseries_tests.cpp
+new file mode 100644
+index 0000000..cce2d05
+--- /dev/null
++++ b/src/test/coinseries_tests.cpp
+@@ -0,0 +1,191 @@
++// Copyright (c) 2026 Sento Daimon
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <addresstype.h>
++#include <base58.h>
++#include <arith_uint256.h>
++#include <chainparams.h>
++#include <chainparamsbase.h>
++#include <common/args.h>
++#include <consensus/amount.h>
++#include <key.h>
++#include <key_io.h>
++#include <kernel/coinseries.h>
++#include <pow.h>
++#include <script/script.h>
++#include <util/chaintype.h>
++#include <validation.h>
++
++#include <test/util/setup_common.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <set>
++#include <string>
++
++BOOST_FIXTURE_TEST_SUITE(coinseries_tests, BasicTestingSetup)
++
++static const std::array<ChainType, 3> ENVS{ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST};
++
++static std::unique_ptr<const CChainParams> Make(CoinSeriesId coin, ChainType chain)
++{
++    return CChainParams::CoinSeries(coin, chain, CChainParams::RegTestOptions{});
++}
++
++BOOST_AUTO_TEST_CASE(coin_names)
++{
++    BOOST_CHECK(CoinFromString("") == CoinSeriesId::NONE);
++    BOOST_CHECK(CoinFromString("half") == CoinSeriesId::HALF);
++    BOOST_CHECK(CoinFromString("cent") == CoinSeriesId::CENT);
++    BOOST_CHECK(!CoinFromString("penny"));
++    BOOST_CHECK_THROW(Make(CoinSeriesId::HALF, ChainType::SIGNET), std::runtime_error);
++    BOOST_CHECK_THROW(Make(CoinSeriesId::HALF, ChainType::TESTNET4), std::runtime_error);
++}
++
++// Every coin/environment must have its own network magic, P2P port, RPC port, data directory,
++// address prefixes and genesis block, and none may collide with Bitcoin's networks.
++BOOST_AUTO_TEST_CASE(identifiers_are_unique)
++{
++    std::set<std::string> magics, hrps, dirs;
++    std::set<uint16_t> ports;
++    std::set<uint256> geneses;
++    std::set<uint32_t> sigids;
++    std::set<std::vector<unsigned char>> pubkey_prefixes, script_prefixes;
++
++    for (ChainType bitcoin_chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::SIGNET, ChainType::REGTEST}) {
++        auto p = CreateChainParams(ArgsManager{}, bitcoin_chain);
++        const auto m = p->MessageStart();
++        magics.insert(std::string(m.begin(), m.end()));
++        ports.insert(p->GetDefaultPort());
++        ports.insert(CreateBaseChainParams(bitcoin_chain)->RPCPort());
++    }
++    const size_t bitcoin_magics = magics.size();
++    const size_t bitcoin_ports = ports.size();
++
++    for (const auto& info : COIN_TABLE) {
++        for (size_t e = 0; e < ENVS.size(); ++e) {
++            auto p = Make(info.coin, ENVS[e]);
++            auto base = CreateBaseChainParams(ENVS[e], info.coin);
++            const auto m = p->MessageStart();
++            magics.insert(std::string(m.begin(), m.end()));
++            BOOST_CHECK_EQUAL(p->GetDefaultPort(), info.p2p_port_main + 10000 * e);
++            BOOST_CHECK_EQUAL(base->RPCPort(), info.rpc_port_main + 10000 * e);
++            ports.insert(p->GetDefaultPort());
++            ports.insert(base->RPCPort());
++            hrps.insert(p->Bech32HRP());
++            dirs.insert(base->DataDir());
++            geneses.insert(p->GetConsensus().hashGenesisBlock);
++            sigids.insert(p->GetConsensus().nChainSigId);
++            pubkey_prefixes.insert(p->Base58Prefix(CChainParams::PUBKEY_ADDRESS));
++            script_prefixes.insert(p->Base58Prefix(CChainParams::SCRIPT_ADDRESS));
++            BOOST_CHECK_EQUAL(p->GetConsensus().nMergeSlot, info.merge_slot);
++            BOOST_CHECK_EQUAL(p->GetConsensus().nSupplyMultiplier, info.multiplier);
++            BOOST_CHECK_EQUAL(p->GetConsensus().nSnapshotHeight, 840000);
++            BOOST_CHECK(p->DNSSeeds().empty());
++            BOOST_CHECK(p->FixedSeeds().empty());
++            BOOST_CHECK(p->GetConsensus().nMinimumChainWork == uint256{});
++            BOOST_CHECK(p->GetConsensus().defaultAssumeValid == uint256{});
++        }
++    }
++    BOOST_CHECK_EQUAL(magics.size(), bitcoin_magics + 15);
++    BOOST_CHECK_EQUAL(ports.size(), bitcoin_ports + 30);
++    BOOST_CHECK_EQUAL(hrps.size(), 15U);
++    BOOST_CHECK_EQUAL(dirs.size(), 15U);
++    BOOST_CHECK_EQUAL(geneses.size(), 15U);
++    BOOST_CHECK_EQUAL(sigids.size(), 15U);
++    BOOST_CHECK_EQUAL(pubkey_prefixes.size(), 15U);
++    BOOST_CHECK_EQUAL(script_prefixes.size(), 15U);
++}
++
++BOOST_AUTO_TEST_CASE(genesis_is_valid)
++{
++    for (const auto& info : COIN_TABLE) {
++        for (ChainType env : ENVS) {
++            auto p = Make(info.coin, env);
++            const CBlock& g = p->GenesisBlock();
++            BOOST_CHECK(g.GetHash() == p->GetConsensus().hashGenesisBlock);
++            BOOST_CHECK(CheckProofOfWork(g.GetHash(), g.nBits, p->GetConsensus()));
++            BOOST_CHECK_EQUAL(g.vtx[0]->GetValueOut(), 0);
++            BOOST_CHECK_EQUAL(GetBlockSubsidy(0, p->GetConsensus()), 0);
++        }
++    }
++}
++
++// Decided reward rule: new-chain height h is rewarded as Bitcoin height 840000 + h, times the multiplier.
++BOOST_AUTO_TEST_CASE(block_subsidy)
++{
++    for (const auto& info : COIN_TABLE) {
++        auto p = Make(info.coin, ChainType::MAIN);
++        const auto& c = p->GetConsensus();
++        const CAmount m = info.multiplier;
++        BOOST_CHECK_EQUAL(GetBlockSubsidy(1, c), 3 * COIN * m + COIN * m / 8);           // 3.125 x m
++        BOOST_CHECK_EQUAL(GetBlockSubsidy(209999, c), 3 * COIN * m + COIN * m / 8);
++        BOOST_CHECK_EQUAL(GetBlockSubsidy(210000, c), (50 * COIN * m) >> 5);            // 1.5625 x m
++        BOOST_CHECK_EQUAL(GetBlockSubsidy(420000, c), (50 * COIN * m) >> 6);
++        BOOST_CHECK_EQUAL(GetBlockSubsidy(64 * 210000, c), 0);
++
++        // Total ever mined plus the nominal claimable amount must not exceed 21 million x multiplier.
++        CAmount mined = 0;
++        for (int era = 0; era < 64; ++era) {
++            const int first = era == 0 ? 1 : era * 210000;
++            const int last = (era + 1) * 210000 - 1;
++            mined += GetBlockSubsidy(first, c) * (last - first + 1);
++        }
++        const CAmount claimable = (19687500 * COIN + 3 * COIN + COIN / 8) * m;   // 19,687,503.125 x m
++        BOOST_CHECK(mined + claimable <= 21000000 * COIN * m);
++        BOOST_CHECK(mined + claimable <= COIN_SERIES_MAX_MONEY_CEILING);
++        BOOST_TEST_MESSAGE(info.name << ": mined " << mined << " + claimable " << claimable);
++    }
++    // Original Bitcoin schedule is unchanged when no coin is selected.
++    auto btc = CreateChainParams(ArgsManager{}, ChainType::MAIN);
++    BOOST_CHECK_EQUAL(GetBlockSubsidy(0, btc->GetConsensus()), 50 * COIN);
++    BOOST_CHECK_EQUAL(GetBlockSubsidy(840000, btc->GetConsensus()), 3 * COIN + COIN / 8);
++}
++
++// Addresses start with recognizable letters on mainnet and differ between chains.
++BOOST_AUTO_TEST_CASE(address_prefixes)
++{
++    CKey key = GenerateRandomKey();
++    const CPubKey pub = key.GetPubKey();
++    const std::map<CoinSeriesId, std::pair<char, char>> letters{
++        {CoinSeriesId::HALF, {'H', 'h'}}, {CoinSeriesId::QUARTER, {'Q', 'q'}}, {CoinSeriesId::DIME, {'D', 'd'}},
++        {CoinSeriesId::NICKEL, {'N', 'n'}}, {CoinSeriesId::CENT, {'C', 'c'}}};
++    for (const auto& info : COIN_TABLE) {
++        auto p = Make(info.coin, ChainType::MAIN);
++        const std::string pkh = EncodeBase58Check([&] {
++            std::vector<unsigned char> v = p->Base58Prefix(CChainParams::PUBKEY_ADDRESS);
++            const PKHash h{pub};
++            v.insert(v.end(), h.begin(), h.end());
++            return v;
++        }());
++        BOOST_CHECK_EQUAL(pkh[0], letters.at(info.coin).first);
++        const std::string sh = EncodeBase58Check([&] {
++            std::vector<unsigned char> v = p->Base58Prefix(CChainParams::SCRIPT_ADDRESS);
++            const ScriptHash h{CScript() << OP_TRUE};
++            v.insert(v.end(), h.begin(), h.end());
++            return v;
++        }());
++        BOOST_CHECK_EQUAL(sh[0], letters.at(info.coin).second);
++        BOOST_CHECK_EQUAL(p->Bech32HRP(), std::string{info.bech32_hrp[0]});
++    }
++}
++
++// Each chain's money limit is 21 million x multiplier; original Bitcoin keeps 21 million.
++BOOST_AUTO_TEST_CASE(money_limit_per_chain)
++{
++    for (const auto& info : COIN_TABLE) {
++        gArgs.ForceSetArg("-coin", std::string{info.name});
++        SelectParams(ChainType::REGTEST);
++        BOOST_CHECK_EQUAL(MAX_MONEY, 21000000 * COIN * info.multiplier);
++        BOOST_CHECK(MoneyRange(21000000 * COIN * info.multiplier));
++        BOOST_CHECK(!MoneyRange(21000000 * COIN * info.multiplier + 1));
++        BOOST_CHECK(MAX_MONEY <= COIN_SERIES_MAX_MONEY_CEILING);
++    }
++    gArgs.ForceSetArg("-coin", "");
++    SelectParams(ChainType::MAIN);
++    BOOST_CHECK_EQUAL(MAX_MONEY, 21000000 * COIN);
++    BOOST_CHECK(!MoneyRange(21000000 * COIN + 1));
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validation.cpp b/src/validation.cpp
+index d3cabe4..ea01646 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -1842,12 +1842,18 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxM
+ 
+ CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
+ {
+-    int halvings = nHeight / consensusParams.nSubsidyHalvingInterval;
++    // Coin Series: the genesis block of a Coin Series chain pays nothing.
++    if (consensusParams.nSnapshotHeight > 0 && nHeight == 0) return 0;
++    // Coin Series: new-chain height h is rewarded as Bitcoin height nSnapshotHeight + h.
++    // For original Bitcoin nSnapshotHeight = 0 and nSupplyMultiplier = 1, so this is unchanged.
++    const int64_t virtual_height = int64_t{consensusParams.nSnapshotHeight} + nHeight;
++    const int64_t halvings = virtual_height / consensusParams.nSubsidyHalvingInterval;
+     // Force block reward to zero when right shift is undefined.
+     if (halvings >= 64)
+         return 0;
+ 
+-    CAmount nSubsidy = 50 * COIN;
++    // Multiply first, then halve (intended: late-era rewards differ slightly from Bitcoin reward x multiplier).
++    CAmount nSubsidy = 50 * COIN * consensusParams.nSupplyMultiplier;
+     // Subsidy is cut in half every 210,000 blocks which will occur approximately every 4 years.
+     nSubsidy >>= halvings;
+     return nSubsidy;
+-- 
+2.43.0
+

@@ -1,0 +1,50 @@
+From 72cfff60ed59add1694e8c77c497e93c9c3711b0 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <sentodaimon@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 02:18:45 +0900
+Subject: [PATCH] Coin Series stage 7: set start difficulty from launch PC
+ measurement
+
+Start bits 0x1f01179e (60,000 hashes per block): measured 105.7 H/s on a
+Ryzen 3 3200U with 4 threads in RandomX fast mode, about 9.5-minute blocks.
+powLimit = start x 4096.
+---
+ doc/coinseries/spec.md     | 2 +-
+ src/kernel/chainparams.cpp | 8 ++++----
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/doc/coinseries/spec.md b/doc/coinseries/spec.md
+index 2d159da..f3d0edf 100644
+--- a/doc/coinseries/spec.md
++++ b/doc/coinseries/spec.md
+@@ -55,7 +55,7 @@ Values marked **(placeholder)** are fixed before launch; values marked **(undeci
+ 
+ ## 5. Difficulty
+ 
+-Parameters: spacing T = 600 s, half-life τ = 7,200 s, relief start R = 3,600 s, relief doubling D = 1,800 s, start bits **(placeholder: 0x1e1bf647, 600,000 hashes per block at 1,000 H/s)**, powLimit = start × 4,096 **(placeholder)**.
++Parameters: spacing T = 600 s, half-life τ = 7,200 s, relief start R = 3,600 s, relief doubling D = 1,800 s, start bits 0x1f01179e (60,000 hashes per block; measured 105.7 H/s on the launch PC, a Ryzen 3 3200U with 4 threads, gives about 9.5-minute blocks), powLimit = start × 4,096 = 0x1179e0… (about 15 hashes per block).
+ 
+ For a new block at height h with parent p (height h−1) and genesis g:
+ 
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index 5c4a2cd..3531c02 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -774,11 +774,11 @@ public:
+                 consensus.nMaxFutureBlockTime = 2 * 60 * 60;
+             }
+         } else {
+-            // Starting target: PLACEHOLDER assuming 1,000 RandomX hashes per second (600,000 hashes per block).
+-            // Replaced by the launch laptop's measured hash rate. Limit = start x 4096 (~146 hashes per block).
+-            consensus.powLimit = uint256{"01bf640000000000000000000000000000000000000000000000000000000000"};
++            // Starting target: 60,000 hashes per block, from the launch PC measurement (Ryzen 3 3200U,
++            // 4 threads, RandomX fast mode: 105.7 H/s -> about 9.5-minute blocks). Limit = start x 4096 (~15 hashes per block).
++            consensus.powLimit = uint256{"1179e00000000000000000000000000000000000000000000000000000000000"};
+             consensus.nASERTHalfLife = 2 * 60 * 60;
+-            consensus.nASERTStartBits = 0x1e1bf647;
++            consensus.nASERTStartBits = 0x1f01179e;
+             consensus.fPowNoRetargeting = false;
+         }
+ 
+-- 
+2.43.0
+

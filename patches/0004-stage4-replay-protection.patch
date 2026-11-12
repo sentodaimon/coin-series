@@ -1,0 +1,213 @@
+From bd07216b69a3e9373dc83a2cae4fe5beaba0b2ba Mon Sep 17 00:00:00 2001
+From: Sento Daimon <339524263+sentodaimon@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 15:39:18 +0900
+Subject: [PATCH] Coin Series stage 4: replay protection - chain identifier in
+ every signature hash
+
+- nChainSigId (distinct per coin and environment) appended to the legacy, SegWit v0 and Taproot
+  signature hash preimages; the legacy SIGHASH_SINGLE special case becomes chain specific
+- set at startup by SelectParams; per-thread override (SighashChainIdScope) so claim ownership
+  proofs can be verified with Bitcoin's original rules
+- tests: pkh / wpkh / tr, SIGHASH_ALL and SINGLE|ANYONECANPAY: valid on own chain, rejected on
+  another coin, on the same coin's testnet and on Bitcoin; wallet spends on regtest
+---
+ src/chainparams.cpp           |  3 ++
+ src/script/interpreter.cpp    |  9 ++++
+ src/script/interpreter.h      | 20 +++++++++
+ src/test/coinseries_tests.cpp | 80 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 112 insertions(+)
+
+diff --git a/src/chainparams.cpp b/src/chainparams.cpp
+index 8183722..652c372 100644
+--- a/src/chainparams.cpp
++++ b/src/chainparams.cpp
+@@ -9,6 +9,7 @@
+ #include <common/args.h>
+ #include <consensus/amount.h>
+ #include <primitives/block.h>
++#include <script/interpreter.h>
+ #include <consensus/params.h>
+ #include <deploymentinfo.h>
+ #include <logging.h>
+@@ -153,4 +154,6 @@ void SelectParams(const ChainType chain)
+     SetMaxMoneyForMultiplier(globalChainParams->GetConsensus().nSupplyMultiplier);
+     // Coin Series: header serialization format (180-byte Coin Series header vs 80-byte Bitcoin header).
+     g_coin_series_header = globalChainParams->GetConsensus().nMergeSlot >= 0;
++    // Coin Series: chain identifier mixed into signature hashes (replay protection; 0 for Bitcoin).
++    g_sighash_chain_id = globalChainParams->GetConsensus().nChainSigId;
+ }
+diff --git a/src/script/interpreter.cpp b/src/script/interpreter.cpp
+index 443714c..d2613ee 100644
+--- a/src/script/interpreter.cpp
++++ b/src/script/interpreter.cpp
+@@ -1565,6 +1565,7 @@ bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, cons
+         ss << execdata.m_codeseparator_pos;
+     }
+ 
++    if (const uint32_t chain_id = SighashChainId()) ss << chain_id; // Coin Series replay protection
+     hash_out = ss.GetSHA256();
+     return true;
+ }
+@@ -1606,6 +1607,12 @@ uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn
+         if ((nHashType & 0x1f) == SIGHASH_SINGLE) {
+             if (nIn >= txTo.vout.size()) {
+                 //  nOut out of range
++                // Coin Series: even this historical special case must not be replayable across chains.
++                if (const uint32_t chain_id = SighashChainId()) {
++                    HashWriter h{};
++                    h << uint256::ONE << chain_id;
++                    return h.GetHash();
++                }
+                 return uint256::ONE;
+             }
+         }
+@@ -1617,6 +1624,7 @@ uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn
+     if (sighash_cache && sighash_cache->Load(nHashType, scriptCode, ss)) {
+         // Add sighash type and hash.
+         ss << nHashType;
++        if (const uint32_t chain_id = SighashChainId()) ss << chain_id; // Coin Series replay protection
+         return ss.GetHash();
+     }
+ 
+@@ -1673,6 +1681,7 @@ uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn
+ 
+     // Add sighash type and hash.
+     ss << nHashType;
++    if (const uint32_t chain_id = SighashChainId()) ss << chain_id; // Coin Series replay protection
+     return ss.GetHash();
+ }
+ 
+diff --git a/src/script/interpreter.h b/src/script/interpreter.h
+index cbb137e..03d656a 100644
+--- a/src/script/interpreter.h
++++ b/src/script/interpreter.h
+@@ -373,6 +373,26 @@ uint256 ComputeTapbranchHash(std::span<const unsigned char> a, std::span<const u
+  *  Requires control block to have valid length (33 + k*32, with k in {0,1,..,128}). */
+ uint256 ComputeTaprootMerkleRoot(std::span<const unsigned char> control, const uint256& tapleaf_hash);
+ 
++/**
++ * Coin Series replay protection: a chain identifier mixed into every signature hash
++ * (legacy, SegWit v0 and Taproot), so a signature made for one chain is invalid on any other chain
++ * and on Bitcoin. 0 = original Bitcoin (nothing mixed in). Set once at startup by SelectParams().
++ */
++inline uint32_t g_sighash_chain_id{0};
++/** Per-thread override, used to verify Bitcoin-signed ownership proofs (claims) with Bitcoin's own rules. */
++inline thread_local std::optional<uint32_t> g_sighash_chain_id_override{};
++inline uint32_t SighashChainId() { return g_sighash_chain_id_override ? *g_sighash_chain_id_override : g_sighash_chain_id; }
++/** RAII helper: compute/verify signature hashes for a given chain identifier on this thread. */
++class SighashChainIdScope
++{
++    std::optional<uint32_t> m_prev;
++public:
++    explicit SighashChainIdScope(uint32_t id) : m_prev{g_sighash_chain_id_override} { g_sighash_chain_id_override = id; }
++    ~SighashChainIdScope() { g_sighash_chain_id_override = m_prev; }
++    SighashChainIdScope(const SighashChainIdScope&) = delete;
++    SighashChainIdScope& operator=(const SighashChainIdScope&) = delete;
++};
++
+ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* error = nullptr);
+ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* error = nullptr);
+ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror = nullptr);
+diff --git a/src/test/coinseries_tests.cpp b/src/test/coinseries_tests.cpp
+index 23ef2a1..6dd3c05 100644
+--- a/src/test/coinseries_tests.cpp
++++ b/src/test/coinseries_tests.cpp
+@@ -11,10 +11,15 @@
+ #include <consensus/amount.h>
+ #include <key.h>
+ #include <key_io.h>
++#include <primitives/transaction.h>
+ #include <kernel/coinseries.h>
+ #include <coinseries_pow.h>
+ #include <hash.h>
+ #include <pow.h>
++#include <script/descriptor.h>
++#include <script/interpreter.h>
++#include <script/sign.h>
++#include <script/signingprovider.h>
+ #include <streams.h>
+ #include <script/script.h>
+ #include <util/chaintype.h>
+@@ -454,4 +459,79 @@ BOOST_AUTO_TEST_CASE(asert_stall_simulation)
+     BOOST_CHECK(median(recover) <= 48.0);
+ }
+ 
++// Replay protection: a signature made on one chain is invalid on every other chain and on Bitcoin.
++BOOST_AUTO_TEST_CASE(replay_protection)
++{
++    const std::set<uint32_t> ids = [] {
++        std::set<uint32_t> r;
++        for (const auto& info : COIN_TABLE) {
++            for (ChainType env : ENVS) r.insert(Make(info.coin, env)->GetConsensus().nChainSigId);
++        }
++        return r;
++    }();
++    BOOST_CHECK_EQUAL(ids.size(), 15U);
++    BOOST_CHECK(!ids.contains(0));
++
++    const uint32_t half_main = Make(CoinSeriesId::HALF, ChainType::MAIN)->GetConsensus().nChainSigId;
++    const uint32_t cent_main = Make(CoinSeriesId::CENT, ChainType::MAIN)->GetConsensus().nChainSigId;
++    const uint32_t half_test = Make(CoinSeriesId::HALF, ChainType::TESTNET)->GetConsensus().nChainSigId;
++
++    const CKey key = GenerateRandomKey();
++    const std::string wif = EncodeSecret(key);
++    const script_verify_flags flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT |
++                                      SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_STRICTENC;
++    for (const std::string type : {"pkh", "wpkh", "tr"}) {
++        FlatSigningProvider keys;
++        std::string error;
++        auto descs = Parse(type + "(" + wif + ")", keys, error, /*require_checksum=*/false);
++        BOOST_REQUIRE_MESSAGE(descs.size() == 1, error);
++        std::vector<CScript> spks;
++        FlatSigningProvider provider;
++        BOOST_REQUIRE(descs[0]->Expand(0, keys, spks, provider));
++        provider.Merge(FlatSigningProvider{keys});
++        const CAmount amount = 5 * COIN;
++        const CTxOut spent{amount, spks[0]};
++
++        for (int hashtype : std::vector<int>{SIGHASH_ALL, SIGHASH_SINGLE | SIGHASH_ANYONECANPAY}) {
++            CMutableTransaction tx;
++            tx.version = 2;
++            tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0});
++            tx.vout.emplace_back(amount - 1000, CScript() << OP_TRUE);
++            PrecomputedTransactionData txdata;
++            txdata.Init(tx, {spent}, /*force=*/true);
++
++            auto verify = [&](uint32_t id) {
++                SighashChainIdScope scope{id};
++                PrecomputedTransactionData vdata;
++                vdata.Init(tx, {spent}, /*force=*/true);
++                MutableTransactionSignatureChecker checker(&tx, 0, amount, vdata, MissingDataBehavior::FAIL);
++                return VerifyScript(tx.vin[0].scriptSig, spent.scriptPubKey, &tx.vin[0].scriptWitness, flags, checker);
++            };
++            {
++                SighashChainIdScope scope{half_main};
++                SignatureData sigdata;
++                MutableTransactionSignatureCreator creator(tx, 0, amount, &txdata, hashtype);
++                BOOST_REQUIRE(ProduceSignature(provider, creator, spent.scriptPubKey, sigdata));
++                UpdateInput(tx.vin[0], sigdata);
++            }
++            BOOST_CHECK_MESSAGE(verify(half_main), type << " valid on its own chain");
++            BOOST_CHECK_MESSAGE(!verify(cent_main), type << " rejected on another coin");
++            BOOST_CHECK_MESSAGE(!verify(half_test), type << " rejected on the same coin's testnet");
++            BOOST_CHECK_MESSAGE(!verify(0), type << " rejected on Bitcoin");
++        }
++    }
++
++    // Legacy SIGHASH_SINGLE with no matching output: Bitcoin's constant hash becomes chain specific.
++    CMutableTransaction tx;
++    tx.vin.resize(2);
++    tx.vout.resize(1);
++    const CScript code = CScript() << OP_TRUE;
++    uint256 btc, half, cent;
++    { SighashChainIdScope s{0}; btc = SignatureHash(code, tx, 1, SIGHASH_SINGLE, 0, SigVersion::BASE); }
++    { SighashChainIdScope s{half_main}; half = SignatureHash(code, tx, 1, SIGHASH_SINGLE, 0, SigVersion::BASE); }
++    { SighashChainIdScope s{cent_main}; cent = SignatureHash(code, tx, 1, SIGHASH_SINGLE, 0, SigVersion::BASE); }
++    BOOST_CHECK(btc == uint256::ONE);
++    BOOST_CHECK(half != btc && cent != btc && half != cent);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+-- 
+2.43.0
+

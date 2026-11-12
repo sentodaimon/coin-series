@@ -1,0 +1,587 @@
+From d4091bef2dc5737317b1a173d3bbda412cf76071 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <339524263+sentodaimon@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:28:21 +0900
+Subject: [PATCH] Coin Series stage 6a: ports below 32768, genesis derived from
+ Bitcoin block H, specification
+
+- ports: main 213xx/212xx, test +1000, regtest +2000 (outside Windows/Linux temporary port ranges)
+- fair start: -beaconheader=<80-byte header of Bitcoin block H>; genesis coinbase text
+  coin-series/<coin>/<env>/<hash of H>, time of H, start bits, reward 0; on main/test the header
+  must carry real Bitcoin proof of work (target <= 2^200); nBeaconHeight / hashBeaconBlock params
+- doc/coinseries/spec.md consensus specification draft
+- tests: genesis_from_beacon_header unit test, contrib/coinseries/genesis_smoke.sh
+---
+ contrib/coinseries/genesis_smoke.sh |  40 ++++++++
+ contrib/coinseries/merge_miner.py   |   4 +-
+ contrib/coinseries/merge_smoke.sh   |   6 +-
+ doc/coinseries/spec.md              | 143 ++++++++++++++++++++++++++++
+ src/chainparams.cpp                 |  33 ++++++-
+ src/chainparamsbase.cpp             |   3 +-
+ src/consensus/params.h              |   4 +
+ src/kernel/chainparams.cpp          |  37 +++++--
+ src/kernel/chainparams.h            |   8 +-
+ src/kernel/coinseries.h             |  17 ++--
+ src/test/coinseries_tests.cpp       |  61 +++++++++++-
+ 11 files changed, 331 insertions(+), 25 deletions(-)
+ create mode 100755 contrib/coinseries/genesis_smoke.sh
+ create mode 100644 doc/coinseries/spec.md
+
+diff --git a/contrib/coinseries/genesis_smoke.sh b/contrib/coinseries/genesis_smoke.sh
+new file mode 100755
+index 0000000..f6f8051
+--- /dev/null
++++ b/contrib/coinseries/genesis_smoke.sh
+@@ -0,0 +1,40 @@
++#!/usr/bin/env bash
++# Coin Series fair-start smoke test (regtest): nodes started with the same Bitcoin reference header
++# derive the same genesis and sync; a node given a different header is on a different chain.
++# Usage: contrib/coinseries/genesis_smoke.sh <build/bin>
++set -uo pipefail
++BIN=${1:-build/bin}
++mk() { python3 - "$1" <<'EOF'
++import hashlib, struct, time, sys
++t = int(time.time()) - 3600
++n = int(sys.argv[1])
++def h(n):
++    return struct.pack('<i', 0x20000000) + bytes(32) + bytes([9]) + bytes(31) + struct.pack('<III', t, 0x207fffff, n)
++while int.from_bytes(hashlib.sha256(hashlib.sha256(h(n)).digest()).digest(), 'little') > 0x7fffff << (8 * 29):
++    n += 1
++print(h(n).hex())
++EOF
++}
++HDR=$(mk 0); HDR2=$(mk 5000)
++A=$(mktemp -d); B=$(mktemp -d); C=$(mktemp -d)
++CA=("$BIN/bitcoin-cli" -datadir="$A" -coin=dime -regtest)
++CB=("$BIN/bitcoin-cli" -datadir="$B" -coin=dime -regtest -rpcport=23998)
++CC=("$BIN/bitcoin-cli" -datadir="$C" -coin=dime -regtest -rpcport=23997)
++cleanup() { "${CA[@]}" stop >/dev/null 2>&1; "${CB[@]}" stop >/dev/null 2>&1; "${CC[@]}" stop >/dev/null 2>&1; sleep 3; rm -rf "$A" "$B" "$C"; }
++trap cleanup EXIT
++"$BIN/bitcoind" -datadir="$A" -coin=dime -regtest -beaconheader="$HDR" -daemon -listen=1 >/dev/null
++"$BIN/bitcoind" -datadir="$B" -coin=dime -regtest -beaconheader="$HDR" -daemon -listen=0 -rpcport=23998 -connect=127.0.0.1:23310 >/dev/null
++"$BIN/bitcoind" -datadir="$C" -coin=dime -regtest -beaconheader="$HDR2" -daemon -listen=0 -rpcport=23997 -connect=127.0.0.1:23310 >/dev/null
++sleep 4
++"${CA[@]}" -rpcwait createwallet w >/dev/null
++"${CA[@]}" generatetoaddress 10 "$("${CA[@]}" getnewaddress)" >/dev/null
++sleep 8
++GA=$("${CA[@]}" getblockhash 0); GB=$("${CB[@]}" -rpcwait getblockhash 0); GC=$("${CC[@]}" -rpcwait getblockhash 0)
++HA=$("${CA[@]}" getblockcount); HB=$("${CB[@]}" getblockcount); HC=$("${CC[@]}" getblockcount)
++echo "A: genesis ${GA:0:16} height $HA"
++echo "B: genesis ${GB:0:16} height $HB (same block H)"
++echo "C: genesis ${GC:0:16} height $HC (different block H)"
++FAIL=0
++[[ "$GA" == "$GB" && "$HB" == "$HA" ]] && echo "PASS  same block H -> same genesis, synced" || { echo "FAIL  same H"; FAIL=1; }
++[[ "$GA" != "$GC" && "$HC" == 0 ]] && echo "PASS  different block H -> different chain, nothing synced" || { echo "FAIL  different H"; FAIL=1; }
++exit $FAIL
+diff --git a/contrib/coinseries/merge_miner.py b/contrib/coinseries/merge_miner.py
+index 9ff8469..1755b5e 100644
+--- a/contrib/coinseries/merge_miner.py
++++ b/contrib/coinseries/merge_miner.py
+@@ -29,9 +29,9 @@ import time
+ import urllib.request
+ 
+ COINS = {  # name: (merge slot, main RPC port)
+-    "half": (0, 38202), "quarter": (1, 38204), "dime": (2, 38210), "nickel": (3, 38220), "cent": (4, 38300),
++    "half": (0, 21202), "quarter": (1, 21204), "dime": (2, 21210), "nickel": (3, 21220), "cent": (4, 21300),
+ }
+-ENV_OFFSET = {"main": 0, "test": 10000, "regtest": 20000}
++ENV_OFFSET = {"main": 0, "test": 1000, "regtest": 2000}
+ ENV_DIR = {"main": "", "test": "-testnet", "regtest": "-regtest"}
+ RANDOMX_FLAG_DEFAULT = 0
+ RANDOMX_FLAG_FULL_MEM = 4
+diff --git a/contrib/coinseries/merge_smoke.sh b/contrib/coinseries/merge_smoke.sh
+index 29657b4..04900fd 100755
+--- a/contrib/coinseries/merge_smoke.sh
++++ b/contrib/coinseries/merge_smoke.sh
+@@ -14,7 +14,7 @@ WORK2=$(mktemp -d)
+ COINS="half quarter dime nickel cent"
+ cleanup() {
+   for c in $COINS; do "$BIN/bitcoin-cli" -datadir="$WORK" -coin=$c -regtest stop >/dev/null 2>&1 || true; done
+-  "$BIN/bitcoin-cli" -datadir="$WORK2" -coin=half -regtest -rpcport=58999 stop >/dev/null 2>&1 || true
++  "$BIN/bitcoin-cli" -datadir="$WORK2" -coin=half -regtest -rpcport=23999 stop >/dev/null 2>&1 || true
+   sleep 3; rm -rf "$WORK" "$WORK2"
+ }
+ trap cleanup EXIT
+@@ -51,9 +51,9 @@ sleep 2
+ if [[ "$(cli half -rpcwait getbestblockhash)" == "$BEST" ]]; then echo "restart reload: PASS"; else echo "restart reload: FAIL"; FAIL=1; fi
+ 
+ # A fresh Half node syncs the chain over P2P.
+-"$BIN/bitcoind" -datadir="$WORK2" -coin=half -regtest -randomxversion=$RXV -daemon -listen=0 -rpcport=58999 -connect=127.0.0.1:58302 >/dev/null
++"$BIN/bitcoind" -datadir="$WORK2" -coin=half -regtest -randomxversion=$RXV -daemon -listen=0 -rpcport=23999 -connect=127.0.0.1:23302 >/dev/null
+ for i in $(seq 1 60); do
+-  N=$("$BIN/bitcoin-cli" -datadir="$WORK2" -coin=half -regtest -rpcport=58999 -rpcwait getblockcount)
++  N=$("$BIN/bitcoin-cli" -datadir="$WORK2" -coin=half -regtest -rpcport=23999 -rpcwait getblockcount)
+   [[ "$N" == "${H[half]}" ]] && break; sleep 1
+ done
+ if [[ "$N" == "${H[half]}" ]]; then echo "p2p sync ($N blocks): PASS"; else echo "p2p sync: FAIL ($N of ${H[half]})"; FAIL=1; fi
+diff --git a/doc/coinseries/spec.md b/doc/coinseries/spec.md
+new file mode 100644
+index 0000000..2d159da
+--- /dev/null
++++ b/doc/coinseries/spec.md
+@@ -0,0 +1,143 @@
++# Bitcoin Coin Series — Consensus Specification
++
++Version: draft 1 (development). Reference implementation: Bitcoin Core v31.1 with the Coin Series changes.
++Values marked **(placeholder)** are fixed before launch; values marked **(undecided)** await a decision.
++
++## 1. Chains
++
++| Chain | Name (`-coin=`) | Ticker | Multiplier m | Merge slot | P2P port main / test / regtest | RPC port main / test / regtest | Bech32 prefix main / test / regtest |
++| --- | --- | --- | --- | --- | --- | --- | --- |
++| Bitcoin Half | half | BTCH | 2 | 0 | 21302 / 22302 / 23302 | 21202 / 22202 / 23202 | hf / thf / rhf |
++| Bitcoin Quarter | quarter | BTCQ | 4 | 1 | 21304 / 22304 / 23304 | 21204 / 22204 / 23204 | qt / tqt / rqt |
++| Bitcoin Dime | dime | BTCD | 10 | 2 | 21310 / 22310 / 23310 | 21210 / 22210 / 23210 | dm / tdm / rdm |
++| Bitcoin Nickel | nickel | BTCN | 20 | 3 | 21320 / 22320 / 23320 | 21220 / 22220 / 23220 | nk / tnk / rnk |
++| Bitcoin Cent | cent | BTCC | 100 | 4 | 21400 / 22400 / 23400 | 21300 / 22300 / 23300 | ct / tct / rct |
++
++- Environment is selected with `-chain=main|test|regtest`. Without `-coin` the software runs original Bitcoin (regression testing only).
++- All ports are below 32768, outside the temporary port ranges of Windows (49152–65535) and Linux (32768–60999).
++- Base58 version bytes (P2PKH / P2SH / WIF), main: Half 40/100/168 (H/h), Quarter 58/120/186 (Q/q), Dime 30/90/158 (D/d), Nickel 53/112/181 (N/n), Cent 28/87/156 (C/c). Test: 130–134 / 135–139 / 200–204. Regtest: 140–144 / 145–149 / 210–214 (in chain order).
++- Network magic: first 4 bytes of `SHA256("coin-series/<name>/<mainnet|testnet|regtest>")`.
++- Data directory: `<datadir>/<name>`, `<name>-testnet`, `<name>-regtest`. The claim snapshot is shared: `<datadir>/snapshot/utxo-840000.dat`.
++- All Bitcoin rules (BIP34, BIP65, BIP66, CSV, SegWit, Taproot) are active from height 1. No checkpoints, minimum chain work, assumed-valid block, DNS seeds or fixed seeds.
++
++## 2. Supply
++
++- Block reward at height h ≥ 1: `(50 × COIN × m) >> floor((840000 + h) / 210000)`, zero when the shift is 64 or more. The genesis block pays nothing.
++  - Height 1–209,999: 3.125 × m; 210,000–419,999: 1.5625 × m; and so on.
++- Money limit per chain: `21,000,000 × COIN × m` (Bitcoin: 21,000,000 × COIN). Every output value and every sum must be within it.
++- Total mined + nominal claimable (19,687,503.125 × m) stays below the limit for every chain (margin 0.02–0.03 coins).
++
++## 3. Block header
++
++| Field | Bytes | Notes |
++| --- | --- | --- |
++| nVersion | 4 | |
++| hashPrevBlock | 32 | |
++| hashMerkleRoot | 32 | |
++| nTime | 4 | |
++| nBits | 4 | compact target |
++| vMergeBranch[0..2] | 3 × 32 | merge tree sibling hashes, leaf level first |
++| nNonce64 | 8 | little-endian |
++
++- Total 180 bytes. The first 76 bytes are the **body**. Block hash (identifier) = SHA256d of all 180 bytes.
++
++## 4. Proof of work: RandomX with five-chain merged mining
++
++1. Commitment `c = SHA256d("coin-series/commit" || body)`.
++2. Merge tree with 8 leaves. Leaf s holds the commitment of the chain whose merge slot is s; unused leaves are 32 zero bytes. Inner node = `SHA256d(left || right)`.
++3. A chain recomputes root `M` from its own commitment at its own slot and the three siblings in the header.
++4. RandomX key `K = SHA256("coin-series/randomx" || LE64(floor(nTime / 1209600)))` — a new key every 2 weeks, derived from the header time only.
++5. `pow = RandomX_v(K, M || LE64(nNonce64))`, v = RandomX version **(undecided: 1 or 2; implementation supports both)**.
++6. Valid if `target = Compact(nBits)` is positive, not overflowing, `≤ powLimit`, and `pow` (read as a little-endian 256-bit number) `≤ target`.
++- The genesis block is fixed by hash and exempt from proof of work.
++- A commitment placed in a different slot yields a different root; one solution can make at most one block per chain.
++- One RandomX solution makes a block on every chain whose target it meets.
++
++## 5. Difficulty
++
++Parameters: spacing T = 600 s, half-life τ = 7,200 s, relief start R = 3,600 s, relief doubling D = 1,800 s, start bits **(placeholder: 0x1e1bf647, 600,000 hashes per block at 1,000 H/s)**, powLimit = start × 4,096 **(placeholder)**.
++
++For a new block at height h with parent p (height h−1) and genesis g:
++
++- h = 1: `nBits = startBits` (anchor; no relief).
++- h ≥ 2:
++  - `e_asert = floor(((p.time − g.time) − T × (h − 1)) × 65536 / τ)` (C++ integer division, truncating toward zero)
++  - `gap = new.time − p.time`; `e_relief = floor((gap − R) × 65536 / D)` if gap > R, else 0
++  - `e = e_asert + e_relief`
++  - `target = start × 2^(e / 65536)` evaluated with the aserti3-2d integer method: `shifts = e >> 16` (arithmetic), `frac = e & 0xffff`, `factor = 65536 + ((195766423245049·frac + 971821376·frac² + 5127·frac³ + 2^47) >> 48)`; if start has more than 224 significant bits it is first shifted right by (bits − 224) and `shifts` increased by the same; `target = (start × factor) >> 16` shifted by `shifts`; 0 becomes 1; above powLimit (or overflow) becomes powLimit.
++  - `nBits = Compact(target)`.
++- The header's nBits must equal this value. Chain work is computed from nBits (so relieved blocks carry less work).
++- Block time must be greater than the median of the previous 11 blocks and at most **10 minutes** ahead of the node's clock.
++
++Simulation with the reference function (1,000× hash power for 48 h then leaving, 30 runs): first block after the exit median 4.5 h (90th percentile 5.6 h); back to ≤ 15-minute average median 21.5 h.
++
++## 6. Replay protection
++
++- Every signature hash (legacy, SegWit v0, Taproot) appends `LE32(chainSigId)` after the existing preimage (legacy/SegWit: after nHashType; Taproot: at the end of the tagged-hash preimage).
++- `chainSigId = 0x43530000 | (mergeSlot << 8) | env` (env: main 0, test 1, regtest 2) — 15 distinct values.
++- The legacy SIGHASH_SINGLE out-of-range case returns `SHA256d(uint256(1) || LE32(chainSigId))` instead of the constant 1.
++- Exception: claim ownership proofs are verified with Bitcoin's original rules (no chain identifier).
++
++## 7. Claim snapshot
++
++- File: Bitcoin Core UTXO snapshot format version 2 (`dumptxoutset`): magic `utxo\xff`, version, network magic, base block hash, coin count, then per transaction id (in ascending byte order): txid, count, (vout, Coin)×count.
++- Consensus value (main, test): serialized UTXO hash `a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96` and base block `0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5` (Bitcoin block 840,000), as published in Bitcoin Core (`m_assumeutxo_data`).
++- Serialized hash: SHA256d over, for each output in file order (outputs of one txid in ascending vout): `outpoint || LE32(height × 2 + coinbase) || CTxOut`.
++- A node on main or test does not start without a verified snapshot.
++
++## 8. Claims
++
++**Snapshot coins.** An unclaimed snapshot output `o` appears in the coin set as value `amount × m`, its original script, height `0x7FFFFFFE`. Once claimed, a marker coin at outpoint `(T, 0)` with `T` = BIP340-style tagged SHA256 (tag `coin-series/claimed`) of the serialized outpoint `o` (value 0, script `OP_FALSE`) exists, and `o` no longer appears. The marker is added when the claim is connected and removed when it is disconnected.
++
++**Claim transaction** (version `0x434C4D31`, "CLM1"):
++1. Every input is a snapshot coin; a non-claim transaction may not spend a snapshot coin.
++2. At most 500 inputs; every input has sequence `0xFFFFFFFF`, empty scriptSig and exactly one witness item (the proof) of 1–10,000 bytes; lock time 0.
++3. Outputs are ordinary; input total − output total = fee.
++4. Signature-operation cost: 20 per input.
++
++**Claim message** (UTF-8, `\n` line breaks, no trailing newline):
++
++```
++Coin Series claim v1
++chain: <name>-<mainnet|testnet|regtest>
++genesis: <genesis hash, hex>
++snapshot: <snapshot serialized hash, hex>
++transaction: <claim txid, hex>
++```
++
++The txid covers version, all inputs, all outputs and lock time; input amounts and scripts are fixed by the committed snapshot.
++
++**Ownership proof** = format byte || payload, verified against the snapshot output script with Bitcoin's original signature rules:
++
++| Format | Payload | Allowed for |
++| --- | --- | --- |
++| 0x01 legacy | 65-byte compact signature over the Bitcoin signed-message hash of the claim message | P2PKH |
++| 0x02 simple | BIP-322 simple witness stack | native SegWit v0 and Taproot |
++| 0x03 full | BIP-322 full `to_sign` transaction | any script |
++
++- BIP-322 checks use the required and upgradeable rules together; anything not valid (including "inconclusive") is rejected.
++- `to_sign` must have version 0, lock time 0, one input with sequence 0, and one zero-value `OP_RETURN` output (no time-locked proofs).
++- Unprefixed (pre-final) BIP-322 signatures and proof-of-funds signatures are not accepted.
++
++## 9. Coinbase
++
++- The coinbase scriptSig must begin with the BIP34 height push followed by a push of the bytes `coin-series`. No coinbase on these chains can reproduce a Bitcoin transaction id, so snapshot outpoints stay unique.
++
++## 10. Genesis (fair start)
++
++- With the release, the Bitcoin height H **(undecided)** is announced (release height + at least 432 blocks).
++- Each node is started with `-beaconheader=<80-byte header of Bitcoin block H>`; on main and test the header must carry real Bitcoin proof of work (target ≤ 2^200).
++- Genesis per chain and environment: coinbase text `coin-series/<name>/<env>/<hash of block H>`, output `OP_RETURN` with value 0, time = time of block H, bits = start bits, nonce 0. Genesis hash uses the 180-byte header.
++- The genesis derived from the block H that remains in Bitcoin's final chain is canonical; blocks built on a replaced block H are invalid.
++- Releases after mining starts hardcode the hash of block H.
++
++## 11. Mining interface
++
++- `getmergework <address> [time]` → commitment, slot, target, bits, time, height, RandomX version and key. Use one time for all five chains.
++- `submitmergework <commitment> [3 sibling hashes] <nonce64>`.
++
++## 12. Open items
++
++- RandomX version 1 or 2.
++- Start target and powLimit (measured on the launch laptop).
++- Bitcoin reference height H.
+diff --git a/src/chainparams.cpp b/src/chainparams.cpp
+index 685cb2c..6ad995f 100644
+--- a/src/chainparams.cpp
++++ b/src/chainparams.cpp
+@@ -7,8 +7,10 @@
+ 
+ #include <chainparamsbase.h>
+ #include <common/args.h>
++#include <arith_uint256.h>
+ #include <consensus/amount.h>
+ #include <primitives/block.h>
++#include <streams.h>
+ #include <script/interpreter.h>
+ #include <consensus/params.h>
+ #include <deploymentinfo.h>
+@@ -123,12 +125,41 @@ const CChainParams &Params() {
+     return *globalChainParams;
+ }
+ 
++/**
++ * Coin Series fair start: parse the 80-byte header of Bitcoin block H (hex, as printed by
++ * "bitcoin-cli getblockheader <hash> false"). On main and test the header must carry real
++ * Bitcoin proof of work (target at most 2^200), so a made-up hash cannot be passed off.
++ */
++static CChainParams::CoinSeriesBeacon ParseBeaconHeader(const std::string& hex, ChainType chain)
++{
++    const auto bytes = TryParseHex<uint8_t>(hex);
++    if (!bytes || bytes->size() != 80) throw std::runtime_error("-beaconheader must be the 80-byte Bitcoin block header in hex");
++    CBlockHeader header;
++    {
++        SpanReader reader{*bytes};
++        reader >> header.nVersion >> header.hashPrevBlock >> header.hashMerkleRoot >> header.nTime >> header.nBits >> header.nNonce;
++    }
++    const uint256 hash = header.GetHashInFormat(/*coin_series=*/false);
++    arith_uint256 target;
++    bool negative, overflow;
++    target.SetCompact(header.nBits, &negative, &overflow);
++    const bool real_network = chain != ChainType::REGTEST;
++    const arith_uint256 max_target = real_network ? (arith_uint256{1} << 200) : ~arith_uint256{0};
++    if (negative || overflow || target == 0 || target > max_target || UintToArith256(hash) > target) {
++        throw std::runtime_error("-beaconheader does not carry valid Bitcoin proof of work");
++    }
++    LogInfo("Coin Series fair start: genesis derived from Bitcoin block %s (time %u)", hash.GetHex(), header.nTime);
++    return {hash, header.nTime};
++}
++
+ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, const ChainType chain)
+ {
+     if (const CoinSeriesId coin = GetCoinArg(args); coin != CoinSeriesId::NONE) {
+         auto opts = CChainParams::RegTestOptions{};
+         if (chain == ChainType::REGTEST) ReadRegTestArgs(args, opts);
+-        return CChainParams::CoinSeries(coin, chain, opts, args.GetIntArg("-randomxversion", 1));
++        std::optional<CChainParams::CoinSeriesBeacon> beacon;
++        if (auto hex = args.GetArg("-beaconheader")) beacon = ParseBeaconHeader(*hex, chain);
++        return CChainParams::CoinSeries(coin, chain, opts, args.GetIntArg("-randomxversion", 1), beacon);
+     }
+     switch (chain) {
+     case ChainType::MAIN:
+diff --git a/src/chainparamsbase.cpp b/src/chainparamsbase.cpp
+index 37ea569..9faea11 100644
+--- a/src/chainparamsbase.cpp
++++ b/src/chainparamsbase.cpp
+@@ -15,6 +15,7 @@
+ 
+ void SetupChainParamsBaseOptions(ArgsManager& argsman)
+ {
++    argsman.AddArg("-beaconheader=<hex>", "Coin Series fair start: 80-byte header (hex) of the announced Bitcoin block H; the genesis block of every chain is derived from it", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-claimsnapshot=<file>", "Coin Series: UTXO snapshot file for claims (default: <datadir>/snapshot/utxo-840000.dat on main and test)", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-claimsnapshothash=<hex>", "Coin Series regtest: serialized UTXO hash of a development claim snapshot", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+     argsman.AddArg("-allowmissingsnapshot", "Coin Series development: start main/test without the claim snapshot (claims impossible)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+@@ -79,7 +80,7 @@ std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const ChainType chain, c
+     const size_t e = static_cast<size_t>(*env);
+     std::string data_dir{info->name};
+     if (*env != CoinEnv::MAIN) data_dir += "-" + std::string{CoinEnvName(*env)};
+-    return std::make_unique<CBaseChainParams>(data_dir, static_cast<uint16_t>(info->rpc_port_main + 10000 * e));
++    return std::make_unique<CBaseChainParams>(data_dir, static_cast<uint16_t>(info->rpc_port_main + COIN_SERIES_PORT_ENV_STEP * e));
+ }
+ 
+ void SelectBaseParams(const ChainType chain)
+diff --git a/src/consensus/params.h b/src/consensus/params.h
+index ace0dfd..3964f26 100644
+--- a/src/consensus/params.h
++++ b/src/consensus/params.h
+@@ -98,6 +98,10 @@ struct Params {
+     uint256 hashSnapshotUtxoSet{};
+     /** Coin Series claims: Bitcoin block hash at the snapshot height (null = not checked, development snapshots). */
+     uint256 hashSnapshotBlock{};
++    /** Coin Series fair start: Bitcoin height H whose block derives the genesis (0 = not announced yet: development genesis). */
++    int nBeaconHeight{0};
++    /** Coin Series fair start: hash of Bitcoin block H, hardcoded only in releases after mining began (null before). */
++    uint256 hashBeaconBlock{};
+     /**
+      * Coin Series difficulty: per-block exponential adjustment (aserti3-2d) anchored at height 1,
+      * whose parent time is the genesis time. 0 = not used (original Bitcoin rules).
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index 502a351..5c4a2cd 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -716,7 +716,7 @@ std::unique_ptr<const CChainParams> CChainParams::RegTest(const RegTestOptions&
+ class CCoinSeriesParams : public CChainParams
+ {
+ public:
+-    CCoinSeriesParams(const CoinInfo& info, CoinEnv env, ChainType chain, const RegTestOptions& opts, int randomx_version)
++    CCoinSeriesParams(const CoinInfo& info, CoinEnv env, ChainType chain, const RegTestOptions& opts, int randomx_version, const std::optional<CoinSeriesBeacon>& beacon)
+     {
+         const size_t e = static_cast<size_t>(env);
+         m_chain_type = chain;
+@@ -824,16 +824,28 @@ public:
+         CSHA256().Write(reinterpret_cast<const unsigned char*>(magic_tag.data()), magic_tag.size()).Finalize(digest);
+         std::copy(digest, digest + 4, pchMessageStart.begin());
+ 
+-        nDefaultPort = info.p2p_port_main + 10000 * e;
++        nDefaultPort = info.p2p_port_main + COIN_SERIES_PORT_ENV_STEP * e;
+         nPruneAfterHeight = env == CoinEnv::REGTEST ? (opts.fastprune ? 100 : 1000) : 100000;
+         m_assumed_blockchain_size = 0;
+         m_assumed_chain_state_size = 0;
+ 
+-        // Development placeholder genesis. Replaced at launch by the genesis bound to a future Bitcoin block.
+-        const uint32_t genesis_bits = UintToArith256(consensus.powLimit).GetCompact();
+-        const std::string genesis_msg = strprintf("Coin Series %s %s development genesis", std::string{info.title}, std::string{CoinEnvName(env)});
++        // Fair start: the Bitcoin reference block height H (announced with the release; 0 = not announced yet).
++        consensus.nBeaconHeight = 0;
++        consensus.hashBeaconBlock = uint256{};
++
+         const CScript genesis_script = CScript() << OP_RETURN;
+-        genesis = CreateGenesisBlock(genesis_msg.c_str(), genesis_script, 1790812800, 0, genesis_bits, 1, /*genesisReward=*/0);
++        if (beacon) {
++            // Genesis derived from Bitcoin block H (fixed formula, decided): coinbase text
++            // "coin-series/<coin>/<environment>/<block H hash>", time = block H time, bits = start target, reward 0.
++            const std::string genesis_msg = strprintf("coin-series/%s/%s/%s", std::string{info.name}, std::string{CoinEnvName(env)}, beacon->hash.GetHex());
++            const uint32_t genesis_bits = consensus.nASERTStartBits ? consensus.nASERTStartBits : UintToArith256(consensus.powLimit).GetCompact();
++            genesis = CreateGenesisBlock(genesis_msg.c_str(), genesis_script, beacon->time, 0, genesis_bits, 1, /*genesisReward=*/0);
++        } else {
++            // Development placeholder genesis (before H is announced).
++            const uint32_t genesis_bits = UintToArith256(consensus.powLimit).GetCompact();
++            const std::string genesis_msg = strprintf("Coin Series %s %s development genesis", std::string{info.title}, std::string{CoinEnvName(env)});
++            genesis = CreateGenesisBlock(genesis_msg.c_str(), genesis_script, 1790812800, 0, genesis_bits, 1, /*genesisReward=*/0);
++        }
+         // Genesis is fixed by hash (exempt from proof of work), hashed in the Coin Series header format.
+         consensus.hashGenesisBlock = genesis.GetHashInFormat(/*coin_series=*/true);
+ 
+@@ -864,7 +876,7 @@ public:
+     }
+ };
+ 
+-std::unique_ptr<const CChainParams> CChainParams::CoinSeries(CoinSeriesId coin, ChainType chain, const RegTestOptions& regtest_options, int randomx_version)
++std::unique_ptr<const CChainParams> CChainParams::CoinSeries(CoinSeriesId coin, ChainType chain, const RegTestOptions& regtest_options, int randomx_version, std::optional<CoinSeriesBeacon> beacon)
+ {
+     if (randomx_version != 1 && randomx_version != 2) throw std::runtime_error("RandomX version must be 1 or 2");
+     const CoinInfo* info = GetCoinInfo(coin);
+@@ -872,7 +884,16 @@ std::unique_ptr<const CChainParams> CChainParams::CoinSeries(CoinSeriesId coin,
+     if (!info || !env) {
+         throw std::runtime_error(strprintf("Coin Series supports only -chain=main, test or regtest (got %s)", ChainTypeToString(chain)));
+     }
+-    return std::make_unique<const CCoinSeriesParams>(*info, *env, chain, regtest_options, randomx_version);
++    auto params = std::make_unique<const CCoinSeriesParams>(*info, *env, chain, regtest_options, randomx_version, beacon);
++    const auto& c = params->GetConsensus();
++    if (c.nBeaconHeight > 0 && !beacon) {
++        throw std::runtime_error(strprintf("This release starts from Bitcoin block %d. Start the node with -beaconheader=<80-byte header of Bitcoin block %d in hex> "
++                                           "(check it on your own Bitcoin node or several block explorers).", c.nBeaconHeight, c.nBeaconHeight));
++    }
++    if (beacon && !c.hashBeaconBlock.IsNull() && beacon->hash != c.hashBeaconBlock) {
++        throw std::runtime_error(strprintf("The Bitcoin reference block given (%s) is not the one fixed in this release (%s).", beacon->hash.GetHex(), c.hashBeaconBlock.GetHex()));
++    }
++    return params;
+ }
+ 
+ std::unique_ptr<const CChainParams> CChainParams::Main()
+diff --git a/src/kernel/chainparams.h b/src/kernel/chainparams.h
+index dbdd591..2ab6a0f 100644
+--- a/src/kernel/chainparams.h
++++ b/src/kernel/chainparams.h
+@@ -165,7 +165,13 @@ public:
+     static std::unique_ptr<const CChainParams> TestNet();
+     static std::unique_ptr<const CChainParams> TestNet4();
+     /** Coin Series chain parameters for one coin and one environment (main / test / regtest). */
+-    static std::unique_ptr<const CChainParams> CoinSeries(CoinSeriesId coin, ChainType chain, const RegTestOptions& regtest_options, int randomx_version = 1);
++    /** Coin Series fair start: the Bitcoin reference block the genesis is derived from. */
++    struct CoinSeriesBeacon {
++        uint256 hash;  //!< Bitcoin block hash (internal byte order)
++        uint32_t time; //!< Bitcoin block timestamp
++    };
++    static std::unique_ptr<const CChainParams> CoinSeries(CoinSeriesId coin, ChainType chain, const RegTestOptions& regtest_options,
++                                                          int randomx_version = 1, std::optional<CoinSeriesBeacon> beacon = std::nullopt);
+ 
+ protected:
+     CChainParams() = default;
+diff --git a/src/kernel/coinseries.h b/src/kernel/coinseries.h
+index c5cae0e..220b713 100644
+--- a/src/kernel/coinseries.h
++++ b/src/kernel/coinseries.h
+@@ -37,8 +37,8 @@ struct CoinInfo {
+     std::string_view ticker;
+     int64_t multiplier;       //!< supply multiplier versus Bitcoin
+     uint8_t merge_slot;       //!< merged mining slot 0..4
+-    uint16_t p2p_port_main;   //!< test = +10000, regtest = +20000
+-    uint16_t rpc_port_main;   //!< test = +10000, regtest = +20000
++    uint16_t p2p_port_main;   //!< test = +1000, regtest = +2000 (all below 32768: outside OS temporary port ranges)
++    uint16_t rpc_port_main;   //!< test = +1000, regtest = +2000
+     std::array<std::string_view, 3> bech32_hrp;   //!< main, test, regtest
+     std::array<uint8_t, 3> pubkey_prefix;          //!< base58 P2PKH version byte per env
+     std::array<uint8_t, 3> script_prefix;          //!< base58 P2SH version byte per env
+@@ -46,11 +46,11 @@ struct CoinInfo {
+ };
+ 
+ inline constexpr std::array<CoinInfo, 5> COIN_TABLE{{
+-    {CoinSeriesId::HALF,    "half",    "Bitcoin Half",    "BTCH", 2,   0, 38302, 38202, {"hf", "thf", "rhf"}, {40, 130, 140}, {100, 135, 145}, {168, 200, 210}},
+-    {CoinSeriesId::QUARTER, "quarter", "Bitcoin Quarter", "BTCQ", 4,   1, 38304, 38204, {"qt", "tqt", "rqt"}, {58, 131, 141}, {120, 136, 146}, {186, 201, 211}},
+-    {CoinSeriesId::DIME,    "dime",    "Bitcoin Dime",    "BTCD", 10,  2, 38310, 38210, {"dm", "tdm", "rdm"}, {30, 132, 142}, {90, 137, 147},  {158, 202, 212}},
+-    {CoinSeriesId::NICKEL,  "nickel",  "Bitcoin Nickel",  "BTCN", 20,  3, 38320, 38220, {"nk", "tnk", "rnk"}, {53, 133, 143}, {112, 138, 148}, {181, 203, 213}},
+-    {CoinSeriesId::CENT,    "cent",    "Bitcoin Cent",    "BTCC", 100, 4, 38400, 38300, {"ct", "tct", "rct"}, {28, 134, 144}, {87, 139, 149},  {156, 204, 214}},
++    {CoinSeriesId::HALF,    "half",    "Bitcoin Half",    "BTCH", 2,   0, 21302, 21202, {"hf", "thf", "rhf"}, {40, 130, 140}, {100, 135, 145}, {168, 200, 210}},
++    {CoinSeriesId::QUARTER, "quarter", "Bitcoin Quarter", "BTCQ", 4,   1, 21304, 21204, {"qt", "tqt", "rqt"}, {58, 131, 141}, {120, 136, 146}, {186, 201, 211}},
++    {CoinSeriesId::DIME,    "dime",    "Bitcoin Dime",    "BTCD", 10,  2, 21310, 21210, {"dm", "tdm", "rdm"}, {30, 132, 142}, {90, 137, 147},  {158, 202, 212}},
++    {CoinSeriesId::NICKEL,  "nickel",  "Bitcoin Nickel",  "BTCN", 20,  3, 21320, 21220, {"nk", "tnk", "rnk"}, {53, 133, 143}, {112, 138, 148}, {181, 203, 213}},
++    {CoinSeriesId::CENT,    "cent",    "Bitcoin Cent",    "BTCC", 100, 4, 21400, 21300, {"ct", "tct", "rct"}, {28, 134, 144}, {87, 139, 149},  {156, 204, 214}},
+ }};
+ 
+ inline const CoinInfo* GetCoinInfo(CoinSeriesId coin)
+@@ -95,6 +95,9 @@ inline std::string_view CoinEnvName(CoinEnv env)
+     return "";
+ }
+ 
++/** Port offset between environments (main +0, test +1000, regtest +2000). */
++static constexpr uint16_t COIN_SERIES_PORT_ENV_STEP{1000};
++
+ #define LIST_COIN_NAMES "half, quarter, dime, nickel, cent"
+ 
+ /** Coin Series claims: transaction version marking a claim transaction (ASCII "CLM1"). */
+diff --git a/src/test/coinseries_tests.cpp b/src/test/coinseries_tests.cpp
+index 6dd3c05..732939e 100644
+--- a/src/test/coinseries_tests.cpp
++++ b/src/test/coinseries_tests.cpp
+@@ -11,6 +11,7 @@
+ #include <consensus/amount.h>
+ #include <key.h>
+ #include <key_io.h>
++#include <util/strencodings.h>
+ #include <primitives/transaction.h>
+ #include <kernel/coinseries.h>
+ #include <coinseries_pow.h>
+@@ -82,8 +83,8 @@ BOOST_AUTO_TEST_CASE(identifiers_are_unique)
+             auto base = CreateBaseChainParams(ENVS[e], info.coin);
+             const auto m = p->MessageStart();
+             magics.insert(std::string(m.begin(), m.end()));
+-            BOOST_CHECK_EQUAL(p->GetDefaultPort(), info.p2p_port_main + 10000 * e);
+-            BOOST_CHECK_EQUAL(base->RPCPort(), info.rpc_port_main + 10000 * e);
++            BOOST_CHECK_EQUAL(p->GetDefaultPort(), info.p2p_port_main + COIN_SERIES_PORT_ENV_STEP * e);
++            BOOST_CHECK_EQUAL(base->RPCPort(), info.rpc_port_main + COIN_SERIES_PORT_ENV_STEP * e);
+             ports.insert(p->GetDefaultPort());
+             ports.insert(base->RPCPort());
+             hrps.insert(p->Bech32HRP());
+@@ -103,6 +104,12 @@ BOOST_AUTO_TEST_CASE(identifiers_are_unique)
+     }
+     BOOST_CHECK_EQUAL(magics.size(), bitcoin_magics + 15);
+     BOOST_CHECK_EQUAL(ports.size(), bitcoin_ports + 30);
++    // All Coin Series ports stay below the operating systems' temporary port ranges
++    // (Windows 49152-65535, Linux 32768-60999).
++    for (const auto& info : COIN_TABLE) {
++        BOOST_CHECK(info.p2p_port_main + 2 * COIN_SERIES_PORT_ENV_STEP < 32768);
++        BOOST_CHECK(info.rpc_port_main + 2 * COIN_SERIES_PORT_ENV_STEP < 32768);
++    }
+     BOOST_CHECK_EQUAL(hrps.size(), 15U);
+     BOOST_CHECK_EQUAL(dirs.size(), 15U);
+     BOOST_CHECK_EQUAL(geneses.size(), 15U);
+@@ -534,4 +541,54 @@ BOOST_AUTO_TEST_CASE(replay_protection)
+     BOOST_CHECK(half != btc && cent != btc && half != cent);
+ }
+ 
++// Fair start: the genesis block is derived from the header of the announced Bitcoin block H.
++BOOST_AUTO_TEST_CASE(genesis_from_beacon_header)
++{
++    auto header_hex = [](uint32_t nonce_start, uint32_t time) {
++        CBlockHeader h;
++        h.nVersion = 0x20000000;
++        h.hashPrevBlock = uint256{7};
++        h.hashMerkleRoot = uint256{9};
++        h.nTime = time;
++        h.nBits = 0x207fffff;
++        h.nNonce = nonce_start;
++        while (UintToArith256(h.GetHashInFormat(false)) > arith_uint256().SetCompact(h.nBits)) ++h.nNonce;
++        DataStream ds{};
++        ds << h.nVersion << h.hashPrevBlock << h.hashMerkleRoot << h.nTime << h.nBits << h.nNonce;
++        return std::make_pair(HexStr(ds), h.GetHashInFormat(false));
++    };
++    auto make = [](const std::string& coin, ChainType chain, const std::string& beacon) {
++        ArgsManager args;
++        args.ForceSetArg("-coin", coin);
++        args.ForceSetArg("-beaconheader", beacon);
++        return CreateChainParams(args, chain);
++    };
++    const auto [a_hex, a_hash] = header_hex(0, 1800000000);
++    const auto [b_hex, b_hash] = header_hex(1000, 1800000000);
++    BOOST_REQUIRE(a_hash != b_hash);
++
++    auto half_a = make("half", ChainType::REGTEST, a_hex);
++    auto half_a2 = make("half", ChainType::REGTEST, a_hex);
++    auto half_b = make("half", ChainType::REGTEST, b_hex);
++    auto cent_a = make("cent", ChainType::REGTEST, a_hex);
++    BOOST_CHECK(half_a->GetConsensus().hashGenesisBlock == half_a2->GetConsensus().hashGenesisBlock); // anyone derives the same genesis
++    BOOST_CHECK(half_a->GetConsensus().hashGenesisBlock != half_b->GetConsensus().hashGenesisBlock);  // a different block H, a different chain
++    BOOST_CHECK(half_a->GetConsensus().hashGenesisBlock != cent_a->GetConsensus().hashGenesisBlock);  // five distinct chains
++    BOOST_CHECK_EQUAL(half_a->GenesisBlock().nTime, 1800000000U);                                      // time = block H time
++    BOOST_CHECK_EQUAL(half_a->GenesisBlock().vtx[0]->GetValueOut(), 0);
++    const CScript& sig = half_a->GenesisBlock().vtx[0]->vin[0].scriptSig;
++    const std::string expected_text = "coin-series/half/regtest/" + a_hash.GetHex();
++    BOOST_CHECK(std::search(sig.begin(), sig.end(), expected_text.begin(), expected_text.end()) != sig.end());
++
++    // On the real networks the header must carry real Bitcoin proof of work.
++    BOOST_CHECK_THROW(make("half", ChainType::MAIN, a_hex), std::runtime_error);
++    BOOST_CHECK_THROW(make("half", ChainType::REGTEST, "00"), std::runtime_error);
++    // The real Bitcoin genesis header is too easy for the floor (target 2^200) and is rejected as well.
++    const std::string bitcoin_genesis = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
++    BOOST_CHECK_THROW(make("half", ChainType::MAIN, bitcoin_genesis), std::runtime_error);
++    // Same header in regtest: accepted, and the derived chain is distinct from the development genesis.
++    auto dev = Make(CoinSeriesId::HALF, ChainType::REGTEST);
++    BOOST_CHECK(make("half", ChainType::REGTEST, bitcoin_genesis)->GetConsensus().hashGenesisBlock != dev->GetConsensus().hashGenesisBlock);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+-- 
+2.43.0
+

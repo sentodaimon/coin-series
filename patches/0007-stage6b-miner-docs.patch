@@ -1,0 +1,1587 @@
+From faf7fc7630da64fcd0550655740e69d7eb8303c5 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <339524263+sentodaimon@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 20:12:21 +0900
+Subject: [PATCH] Coin Series stage 6b: C++ merged miner (cs-miner), Windows
+ build notes, docs
+
+- contrib/coinseries/miner/cs-miner.cpp: multithreaded RandomX merged miner (fast/light mode),
+  JSON-RPC over HTTP with cookie authentication, Linux and Windows (mingw, static)
+- contrib/coinseries/miner_smoke.sh
+- doc/coinseries: whitepaper and manual updated with implemented decisions
+---
+ contrib/coinseries/miner/cs-miner.cpp | 399 ++++++++++++
+ contrib/coinseries/miner_smoke.sh     |  24 +
+ doc/coinseries/manual.md              | 862 ++++++++++++++++++++++++++
+ doc/coinseries/whitepaper.md          | 254 ++++++++
+ 4 files changed, 1539 insertions(+)
+ create mode 100644 contrib/coinseries/miner/cs-miner.cpp
+ create mode 100755 contrib/coinseries/miner_smoke.sh
+ create mode 100644 doc/coinseries/manual.md
+ create mode 100644 doc/coinseries/whitepaper.md
+
+diff --git a/contrib/coinseries/miner/cs-miner.cpp b/contrib/coinseries/miner/cs-miner.cpp
+new file mode 100644
+index 0000000..1ffc6a6
+--- /dev/null
++++ b/contrib/coinseries/miner/cs-miner.cpp
+@@ -0,0 +1,399 @@
++// Copyright (c) 2026 Sento Daimon
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++//
++// cs-miner: Coin Series merged miner. One RandomX computation mines all five chains.
++//
++//   cs-miner --coin half=ADDR --coin quarter=ADDR --coin dime=ADDR --coin nickel=ADDR --coin cent=ADDR
++//            [--chain main|test|regtest] [--datadir DIR] [--threads N] [--light] [--blocks N]
++//
++// It asks each local node for work (getmergework, same header time for all), builds the 8-leaf merge
++// tree, runs RandomX on root || nonce64 with N threads and submits to every chain whose target is met
++// (submitmergework). RPC authentication uses each node's .cookie file in the data directory.
++
++#include <randomx.h>
++#include <univalue.h>
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <iomanip>
++#include <iostream>
++#include <map>
++#include <mutex>
++#include <optional>
++#include <random>
++#include <cstdlib>
++#include <sstream>
++#include <string>
++#include <thread>
++#include <vector>
++
++#ifdef _WIN32
++#include <winsock2.h>
++#include <ws2tcpip.h>
++using socket_t = SOCKET;
++static void CloseSocket(socket_t s) { closesocket(s); }
++#else
++#include <netdb.h>
++#include <sys/socket.h>
++#include <unistd.h>
++using socket_t = int;
++static void CloseSocket(socket_t s) { close(s); }
++#endif
++
++namespace {
++using Bytes32 = std::array<uint8_t, 32>;
++
++// ---------------------------------------------------------------- SHA-256 (for the merge tree)
++struct Sha256 {
++    uint32_t h[8];
++    uint8_t buf[64];
++    uint64_t len{0};
++    size_t n{0};
++    static constexpr uint32_t K[64] = {
++        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
++        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
++        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
++        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
++    Sha256() { const uint32_t init[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19}; std::copy(init, init + 8, h); }
++    static uint32_t R(uint32_t x, int r) { return (x >> r) | (x << (32 - r)); }
++    void Block(const uint8_t* p)
++    {
++        uint32_t w[64];
++        for (int i = 0; i < 16; ++i) w[i] = uint32_t(p[4 * i]) << 24 | uint32_t(p[4 * i + 1]) << 16 | uint32_t(p[4 * i + 2]) << 8 | p[4 * i + 3];
++        for (int i = 16; i < 64; ++i) w[i] = w[i - 16] + (R(w[i - 15], 7) ^ R(w[i - 15], 18) ^ (w[i - 15] >> 3)) + w[i - 7] + (R(w[i - 2], 17) ^ R(w[i - 2], 19) ^ (w[i - 2] >> 10));
++        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
++        for (int i = 0; i < 64; ++i) {
++            uint32_t t1 = hh + (R(e, 6) ^ R(e, 11) ^ R(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i];
++            uint32_t t2 = (R(a, 2) ^ R(a, 13) ^ R(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
++            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
++        }
++        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
++    }
++    void Write(const uint8_t* p, size_t l)
++    {
++        len += l;
++        while (l) {
++            size_t k = std::min(l, 64 - n);
++            std::memcpy(buf + n, p, k); n += k; p += k; l -= k;
++            if (n == 64) { Block(buf); n = 0; }
++        }
++    }
++    Bytes32 Final()
++    {
++        uint64_t bits = len * 8;
++        uint8_t pad = 0x80;
++        Write(&pad, 1);
++        uint8_t z = 0;
++        while (n != 56) Write(&z, 1);
++        uint8_t lb[8];
++        for (int i = 0; i < 8; ++i) lb[i] = uint8_t(bits >> (56 - 8 * i));
++        Write(lb, 8);
++        Bytes32 out;
++        for (int i = 0; i < 8; ++i) for (int j = 0; j < 4; ++j) out[4 * i + j] = uint8_t(h[i] >> (24 - 8 * j));
++        return out;
++    }
++};
++Bytes32 Sha256d(const uint8_t* p, size_t l)
++{
++    Sha256 a; a.Write(p, l); Bytes32 x = a.Final();
++    Sha256 b; b.Write(x.data(), 32); return b.Final();
++}
++Bytes32 Node(const Bytes32& l, const Bytes32& r)
++{
++    uint8_t b[64]; std::memcpy(b, l.data(), 32); std::memcpy(b + 32, r.data(), 32); return Sha256d(b, 64);
++}
++
++// ---------------------------------------------------------------- hex / base64
++std::vector<uint8_t> FromHex(const std::string& s)
++{
++    std::vector<uint8_t> o;
++    for (size_t i = 0; i + 1 < s.size(); i += 2) o.push_back(uint8_t(std::stoi(s.substr(i, 2), nullptr, 16)));
++    return o;
++}
++std::string ToHex(const uint8_t* p, size_t l)
++{
++    static const char* d = "0123456789abcdef";
++    std::string s;
++    for (size_t i = 0; i < l; ++i) { s += d[p[i] >> 4]; s += d[p[i] & 15]; }
++    return s;
++}
++// uint256 display hex (reversed) <-> internal bytes
++Bytes32 FromDisplayHex(const std::string& s) { auto v = FromHex(s); Bytes32 b{}; for (size_t i = 0; i < 32 && i < v.size(); ++i) b[i] = v[31 - i]; return b; }
++std::string ToDisplayHex(const Bytes32& b) { Bytes32 r; for (int i = 0; i < 32; ++i) r[i] = b[31 - i]; return ToHex(r.data(), 32); }
++std::string Base64(const std::string& in)
++{
++    static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    std::string o; int val = 0, bits = -6;
++    for (unsigned char c : in) { val = (val << 8) + c; bits += 8; while (bits >= 0) { o += t[(val >> bits) & 63]; bits -= 6; } }
++    if (bits > -6) o += t[((val << 8) >> (bits + 8)) & 63];
++    while (o.size() % 4) o += '=';
++    return o;
++}
++
++// ---------------------------------------------------------------- JSON-RPC over HTTP
++struct Node_t {
++    std::string coin, address, host, auth;
++    int port;
++    int slot;
++};
++
++std::optional<UniValue> Rpc(const Node_t& node, const std::string& method, const UniValue& params, std::string& error)
++{
++    UniValue req(UniValue::VOBJ);
++    req.pushKV("jsonrpc", "1.0"); req.pushKV("id", "cs-miner"); req.pushKV("method", method); req.pushKV("params", params);
++    const std::string body = req.write();
++    std::ostringstream http;
++    http << "POST / HTTP/1.1\r\nHost: " << node.host << "\r\nAuthorization: Basic " << Base64(node.auth)
++         << "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " << body.size() << "\r\n\r\n" << body;
++    const std::string out = http.str();
++
++    addrinfo hints{}, *res = nullptr;
++    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
++    if (getaddrinfo(node.host.c_str(), std::to_string(node.port).c_str(), &hints, &res) != 0 || !res) { error = "cannot resolve host"; return std::nullopt; }
++    socket_t s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
++    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) { freeaddrinfo(res); CloseSocket(s); error = "node not reachable on port " + std::to_string(node.port); return std::nullopt; }
++    freeaddrinfo(res);
++    send(s, out.data(), (int)out.size(), 0);
++    std::string resp; char b[4096]; int r;
++    while ((r = recv(s, b, sizeof(b), 0)) > 0) resp.append(b, r);
++    CloseSocket(s);
++    const auto p = resp.find("\r\n\r\n");
++    if (p == std::string::npos) { error = "bad HTTP response"; return std::nullopt; }
++    if (resp.compare(0, 12, "HTTP/1.1 401") == 0) { error = "authentication failed (check the .cookie file / datadir)"; return std::nullopt; }
++    UniValue v;
++    if (!v.read(resp.substr(p + 4))) { error = "bad JSON response"; return std::nullopt; }
++    if (!v["error"].isNull()) { error = v["error"].write(); return std::nullopt; }
++    return v["result"];
++}
++
++std::string ReadCookie(const std::string& datadir, const std::string& coin, const std::string& chain)
++{
++    const std::string sub = coin + (chain == "main" ? "" : chain == "test" ? "-testnet" : "-regtest");
++    std::ifstream f(datadir + "/" + sub + "/.cookie");
++    std::string c;
++    std::getline(f, c);
++    return c;
++}
++
++std::string DefaultDatadir()
++{
++#ifdef _WIN32
++    const char* a = std::getenv("LOCALAPPDATA");
++    return a ? std::string(a) + "\\Bitcoin" : ".";
++#else
++    const char* h = std::getenv("HOME");
++    return h ? std::string(h) + "/.bitcoin" : ".";
++#endif
++}
++
++// ---------------------------------------------------------------- RandomX
++struct Rx {
++    randomx_cache* cache{nullptr};
++    randomx_dataset* dataset{nullptr};
++    randomx_flags flags{RANDOMX_FLAG_DEFAULT};
++    std::string key;
++    int version{0};
++    bool fast{true};
++    void Release()
++    {
++        if (dataset) randomx_release_dataset(dataset);
++        if (cache) randomx_release_cache(cache);
++        dataset = nullptr; cache = nullptr; key.clear();
++    }
++    void SetKey(const std::vector<uint8_t>& k, int v, unsigned threads)
++    {
++        const std::string ks(k.begin(), k.end());
++        if (ks == key && v == version) return;
++        Release();
++        flags = randomx_get_flags();
++        if (v == 2) flags = flags | RANDOMX_FLAG_V2;
++        cache = randomx_alloc_cache(flags);
++        if (!cache) { flags = RANDOMX_FLAG_DEFAULT; if (v == 2) flags = flags | RANDOMX_FLAG_V2; cache = randomx_alloc_cache(flags); }
++        randomx_init_cache(cache, k.data(), k.size());
++        if (fast) {
++            dataset = randomx_alloc_dataset(flags);
++            if (!dataset) { std::cerr << "Not enough memory for fast mode (about 2.1 GB); using light mode\n"; fast = false; }
++            else {
++                const unsigned long items = randomx_dataset_item_count();
++                std::vector<std::thread> ts;
++                for (unsigned i = 0; i < threads; ++i) {
++                    const unsigned long start = items * i / threads, end = items * (i + 1) / threads;
++                    ts.emplace_back([=, this] { randomx_init_dataset(dataset, cache, start, end - start); });
++                }
++                for (auto& t : ts) t.join();
++            }
++        }
++        key = ks; version = v;
++    }
++    randomx_vm* NewVm() const
++    {
++        return fast ? randomx_create_vm(flags | RANDOMX_FLAG_FULL_MEM, nullptr, dataset) : randomx_create_vm(flags, cache, nullptr);
++    }
++};
++
++// little-endian hash <= big-endian target
++bool MeetsTarget(const uint8_t* hash_le, const std::vector<uint8_t>& target_be)
++{
++    for (int i = 0; i < 32; ++i) {
++        const uint8_t h = hash_le[31 - i], t = target_be[i];
++        if (h != t) return h < t;
++    }
++    return true;
++}
++
++void Usage()
++{
++    std::cout << "cs-miner: Coin Series merged miner\n\n"
++                 "  --coin NAME=ADDRESS   chain to mine and its reward address (repeat for each chain)\n"
++                 "  --chain main|test|regtest   (default main)\n"
++                 "  --datadir DIR         node data directory (default: the node's default)\n"
++                 "  --host HOST           node host (default 127.0.0.1)\n"
++                 "  --threads N           mining threads (default: half of the CPU threads, to limit laptop heat)\n"
++                 "  --light               light mode (256 MB instead of 2.1 GB, much slower)\n"
++                 "  --refresh SECONDS     fetch fresh work at least this often (default 30)\n"
++                 "  --blocks N            stop after every chain found N blocks (default: run forever)\n";
++}
++} // namespace
++
++int main(int argc, char** argv)
++{
++#ifdef _WIN32
++    WSADATA wsa;
++    WSAStartup(MAKEWORD(2, 2), &wsa);
++#endif
++    const std::map<std::string, std::pair<int, int>> COINS{{"half", {0, 21202}}, {"quarter", {1, 21204}}, {"dime", {2, 21210}}, {"nickel", {3, 21220}}, {"cent", {4, 21300}}};
++    std::string chain = "main", datadir = DefaultDatadir(), host = "127.0.0.1";
++    unsigned threads = std::max(1u, std::thread::hardware_concurrency() / 2);
++    bool light = false;
++    int refresh = 30, blocks = 0;
++    std::vector<std::pair<std::string, std::string>> coins;
++    for (int i = 1; i < argc; ++i) {
++        const std::string a = argv[i];
++        auto next = [&]() -> std::string { if (i + 1 >= argc) { Usage(); std::exit(1); } return argv[++i]; };
++        if (a == "--coin") { const std::string v = next(); const auto e = v.find('='); if (e == std::string::npos) { Usage(); return 1; } coins.emplace_back(v.substr(0, e), v.substr(e + 1)); }
++        else if (a == "--chain") chain = next();
++        else if (a == "--datadir") datadir = next();
++        else if (a == "--host") host = next();
++        else if (a == "--threads") threads = std::max(1, std::stoi(next()));
++        else if (a == "--light") light = true;
++        else if (a == "--refresh") refresh = std::stoi(next());
++        else if (a == "--blocks") blocks = std::stoi(next());
++        else { Usage(); return a == "--help" || a == "-h" ? 0 : 1; }
++    }
++    if (coins.empty()) { Usage(); return 1; }
++    const int env_offset = chain == "main" ? 0 : chain == "test" ? 1000 : 2000;
++    std::vector<Node_t> nodes;
++    for (const auto& [name, addr] : coins) {
++        auto it = COINS.find(name);
++        if (it == COINS.end()) { std::cerr << "unknown coin " << name << "\n"; return 1; }
++        const std::string cookie = ReadCookie(datadir, name, chain);
++        if (cookie.empty()) { std::cerr << "cannot read the .cookie file of the " << name << " node in " << datadir << " (is the node running?)\n"; return 1; }
++        nodes.push_back({name, addr, host, cookie, it->second.second + env_offset, it->second.first});
++    }
++    std::cout << "cs-miner: " << nodes.size() << " chain(s), " << threads << " thread(s), " << (light ? "light" : "fast") << " mode\n";
++
++    Rx rx;
++    rx.fast = !light;
++    std::map<std::string, int> found;
++    for (const auto& n : nodes) found[n.coin] = 0;
++    uint64_t total_hashes = 0;
++    double mining_seconds = 0; // excludes RandomX key setup (dataset initialisation)
++
++    while (true) {
++        if (blocks > 0 && std::all_of(found.begin(), found.end(), [&](const auto& kv) { return kv.second >= blocks; })) break;
++        // Fetch work with one common header time.
++        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
++        struct Work { const Node_t* node; std::string commitment; int slot; std::vector<uint8_t> target; int64_t height; std::string key; int version; };
++        std::vector<Work> work;
++        for (const auto& n : nodes) {
++            std::string err;
++            UniValue p(UniValue::VARR); p.push_back(n.address); p.push_back(now);
++            auto r = Rpc(n, "getmergework", p, err);
++            if (!r) { UniValue p2(UniValue::VARR); p2.push_back(n.address); r = Rpc(n, "getmergework", p2, err); }
++            if (!r) { std::cerr << n.coin << ": " << err << "\n"; continue; }
++            work.push_back({&n, (*r)["commitment"].get_str(), (*r)["slot"].getInt<int>(), FromHex((*r)["target"].get_str()), (*r)["height"].getInt<int64_t>(),
++                            (*r)["randomxkey"].get_str(), (*r)["randomxversion"].getInt<int>()});
++        }
++        if (work.empty()) { std::this_thread::sleep_for(std::chrono::seconds(5)); continue; }
++        // Mine together only chains that share the first chain's RandomX key and version.
++        const std::string key = work[0].key; const int version = work[0].version;
++        work.erase(std::remove_if(work.begin(), work.end(), [&](const Work& w) { return w.key != key || w.version != version; }), work.end());
++        rx.SetKey(FromHex(key), version, threads);
++
++        std::array<Bytes32, 8> leaves{};
++        for (const auto& w : work) leaves[w.slot] = FromDisplayHex(w.commitment);
++        std::array<Bytes32, 4> l1; for (int i = 0; i < 4; ++i) l1[i] = Node(leaves[2 * i], leaves[2 * i + 1]);
++        std::array<Bytes32, 2> l2{Node(l1[0], l1[1]), Node(l1[2], l1[3])};
++        const Bytes32 root = Node(l2[0], l2[1]);
++
++        std::atomic<bool> stop{false};
++        std::atomic<uint64_t> hashes{0};
++        std::mutex mu;
++        std::vector<std::pair<size_t, uint64_t>> solutions; // (work index, nonce)
++        std::vector<bool> solved(work.size(), false);
++        const uint64_t base = (uint64_t(std::random_device{}()) << 32) ^ uint64_t(now);
++        std::vector<std::thread> ts;
++        for (unsigned t = 0; t < threads; ++t) {
++            ts.emplace_back([&, t] {
++                randomx_vm* vm = rx.NewVm();
++                if (!vm) { stop = true; return; }
++                uint8_t input[40], out[32];
++                std::memcpy(input, root.data(), 32);
++                for (uint64_t nonce = base + t; !stop; nonce += threads) {
++                    for (int i = 0; i < 8; ++i) input[32 + i] = uint8_t(nonce >> (8 * i));
++                    randomx_calculate_hash(vm, input, 40, out);
++                    ++hashes;
++                    for (size_t w = 0; w < work.size(); ++w) {
++                        if (MeetsTarget(out, work[w].target)) {
++                            std::lock_guard<std::mutex> l(mu);
++                            if (!solved[w]) { solved[w] = true; solutions.emplace_back(w, nonce); }
++                        }
++                    }
++                    if (std::all_of(solved.begin(), solved.end(), [](bool b) { return b; })) stop = true;
++                }
++                randomx_destroy_vm(vm);
++            });
++        }
++        const auto round_start = std::chrono::steady_clock::now();
++        const auto deadline = round_start + std::chrono::seconds(refresh);
++        while (!stop && std::chrono::steady_clock::now() < deadline) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(200));
++            std::lock_guard<std::mutex> l(mu);
++            if (!solutions.empty()) stop = true; // submit as soon as any chain is solved, then refresh work
++        }
++        stop = true;
++        for (auto& t : ts) t.join();
++        total_hashes += hashes;
++        mining_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - round_start).count();
++
++        for (const auto& [w, nonce] : solutions) {
++            const auto& wk = work[w];
++            const int s = wk.slot;
++            UniValue branch(UniValue::VARR);
++            branch.push_back(ToDisplayHex(leaves[s ^ 1]));
++            branch.push_back(ToDisplayHex(l1[(s >> 1) ^ 1]));
++            branch.push_back(ToDisplayHex(l2[(s >> 2) ^ 1]));
++            UniValue p(UniValue::VARR); p.push_back(wk.commitment); p.push_back(branch); p.push_back(std::to_string(nonce));
++            std::string err;
++            auto r = Rpc(*wk.node, "submitmergework", p, err);
++            const bool ok = r && (*r)["accepted"].isTrue();
++            if (ok) ++found[wk.node->coin];
++            std::cout << wk.node->coin << " height " << wk.height << " nonce " << nonce << (ok ? " accepted" : " rejected " + (r ? (*r)["reason"].write() : err)) << std::endl;
++        }
++        std::cout << "  " << std::fixed << std::setprecision(1) << (total_hashes / std::max(mining_seconds, 1e-9)) << " H/s average (" << threads << " thread(s))" << std::endl;
++    }
++    std::cout << "done:";
++    for (const auto& [c, n] : found) std::cout << " " << c << "=" << n;
++    std::cout << std::endl;
++    rx.Release();
++    return 0;
++}
+diff --git a/contrib/coinseries/miner_smoke.sh b/contrib/coinseries/miner_smoke.sh
+new file mode 100755
+index 0000000..4603778
+--- /dev/null
++++ b/contrib/coinseries/miner_smoke.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++# cs-miner smoke test (regtest): five nodes, the C++ merged miner mines all five chains together.
++# Usage: contrib/coinseries/miner_smoke.sh <build/bin> [extra cs-miner args]
++set -uo pipefail
++BIN=${1:-build/bin}; shift || true
++WORK=$(mktemp -d)
++COINS="half quarter dime nickel cent"
++cleanup() { for c in $COINS; do "$BIN/bitcoin-cli" -datadir="$WORK" -coin=$c -regtest stop >/dev/null 2>&1; done; sleep 3; rm -rf "$WORK"; }
++trap cleanup EXIT
++for c in $COINS; do "$BIN/bitcoind" -datadir="$WORK" -coin=$c -regtest -daemon -listen=0 >/dev/null; done
++sleep 3
++ARGS=()
++for c in $COINS; do
++  "$BIN/bitcoin-cli" -datadir="$WORK" -coin=$c -regtest -rpcwait createwallet w >/dev/null
++  ARGS+=(--coin "$c=$("$BIN/bitcoin-cli" -datadir="$WORK" -coin=$c -regtest getnewaddress)")
++done
++"$BIN/cs-miner" --chain regtest --datadir "$WORK" --blocks 10 --refresh 5 "${ARGS[@]}" "$@" | tail -4
++FAIL=0
++for c in $COINS; do
++  H=$("$BIN/bitcoin-cli" -datadir="$WORK" -coin=$c -regtest getblockcount)
++  echo "$c height $H"; [[ $H -ge 10 ]] || FAIL=1
++done
++[[ $FAIL == 0 ]] && echo "PASS  cs-miner mined all five chains" || echo "FAIL  cs-miner"
++exit $FAIL
+diff --git a/doc/coinseries/manual.md b/doc/coinseries/manual.md
+new file mode 100644
+index 0000000..35d5d1d
+--- /dev/null
++++ b/doc/coinseries/manual.md
+@@ -0,0 +1,862 @@
++# Bitcoin Coin Series — Implementation Manual
++
++October 7, 2026
++
++## 1. Purpose of This Document
++
++This is an implementation guide containing the design and work procedure for building and running five independent chains based on Bitcoin Core.
++
++- Intended reader: a developer or coding AI able to modify and build the Bitcoin Core source
++- Project owner: a single non-developer. The owner does not type commands or edit files. The implementer presents options only at decision points and carries out everything else independently
++- Level of this document: a design direction document. It is not a byte-level specification. A separate consensus specification must be written before coding (Section 10, Step 1)
++- Labels
++    - **Decided**: decided by the owner. Do not change it on your own; if a change is needed, ask first with reasons
++    - **Proposed**: a design draft. You may change it if you find a better way, but report the change
++    - **To verify**: figures or facts to be checked against primary sources during the work
++- Code in this document is a draft showing direction; it has not been compiled or tested
++- "Coin Series" is this document's collective name for the five coins
++- Progress principle: design refinement, prototype development and the public testnet go ahead, but the mainnet launches only after every launch criterion in Section 11 is met
++
++## 2. Project Overview
++
++Five independent chains that keep Bitcoin's transaction system, multiply the supply by 2, 4, 10, 20 and 100, and change the mining, difficulty, signature, distribution and header format, all started at the same moment as a personal long-term experiment.
++
++**What is being built**
++
++- Bitcoin Half, Quarter, Dime, Nickel and Cent: five parallel assets modeled on US coin denominations (1/2, 1/4, 1/10, 1/20, 1/100)
++- The five chains are independent and each starts from a new genesis block. Bitcoin's transaction history is not imported
++- Holders at Bitcoin block 840,000 receive each of the five coins times its multiplier, free, by proving ownership. No deadline
++- One mining computation produces blocks on all five chains and earns all five rewards together
++- Mining runs on ordinary computers. The computation of existing SHA-256 specialized miners cannot be used (this does not prevent any person from participating)
++
++**Principles (Decided)**
++
++1. Issued and operated by one person: minimize third-party involvement such as cloud providers and exchanges
++2. Accessibility: runs on one spare home laptop without dedicated servers or expensive hardware
++3. Free distribution: holders prove ownership and claim themselves, with no deadline
++4. No premine and no issuer allocation: mining is open to everyone under identical conditions from the first block
++5. No exchange listing, no price pumping, no investment solicitation or promise of returns
++6. Launch first; add-on services (explorer, exchange tool) later
++7. A long-term project of 10 years or more. No assumption of short-term results
++8. The mainnet is never restarted. Defect testing is done on a valueless public testnet; mainnet defects are fixed through rule improvements
++
++**Design constraints (do not propose anything outside these)**
++
++| Not done | Reason |
++| --- | --- |
++| A fork that shares Bitcoin's transaction history | Every node would have to store hundreds of GB of history; incompatible with laptop operation |
++| SHA-256 mining | Specialized miners would make ordinary-computer mining meaningless; easy to attack with rented hash power |
++| Merged mining with Bitcoin | Rewards would go to existing Bitcoin miners |
++| Launching the five coins one at a time | Breaks the fairness of starting at the same moment under the same conditions |
++| Different block intervals per chain | Complicates merged mining. Rewards apply the multiplier to the amount, not to frequency |
++| An operator-run exchange at a fixed ratio to bitcoin | Incompatible with free distribution; would need reserves comparable to the entire bitcoin supply |
++| Custody of others' coins or private keys | May require registration as a virtual asset service provider; conflicts with Principle 1 |
++| A website that accepts private keys or recovery phrases | Indistinguishable from a phishing site |
++| Cloud or dedicated servers | Principles 1 and 2 |
++| Issuer power to fix particular blocks | Concentrates control in the issuer |
++
++**Realities**
++
++- Consensus that "each coin is worth bitcoin divided by its multiplier" cannot be enforced and is unlikely to form. A price may never form
++- Early on there may be few or no miners, so the issuer's share of mining may be overwhelmingly high. This is not a design privilege but a result of participation; the whitepaper says so
++
++## 3. Specifications of the Five Coins
++
++The five chains differ only in multiplier and network identifiers; all other rules are identical.
++
++**Issuance (Decided)**
++
++| Coin | Ticker | Unit vs. Bitcoin | Multiplier | Block reward (at start) | Nominal supply cap | Claim per 1 BTC held |
++| --- | --- | --- | --- | --- | --- | --- |
++| Bitcoin Half | BTCH | 1/2 | 2 | 6.25 | 42,000,000 | 2 |
++| Bitcoin Quarter | BTCQ | 1/4 | 4 | 12.5 | 84,000,000 | 4 |
++| Bitcoin Dime | BTCD | 1/10 | 10 | 31.25 | 210,000,000 | 10 |
++| Bitcoin Nickel | BTCN | 1/20 | 20 | 62.5 | 420,000,000 | 20 |
++| Bitcoin Cent | BTCC | 1/100 | 100 | 312.5 | 2,100,000,000 | 100 |
++
++- Block interval 10 minutes, halving every 210,000 blocks; common to all five chains
++- Reward = Bitcoin's current block reward of 3.125 times the multiplier
++- Monthly issuance: 4,320 blocks, equivalent to 13,500 BTC times the multiplier (27,000 Half, 1,350,000 Cent)
++- Composition of the cap: claimable amount (nominal ceiling of 19,687,503.125 BTC equivalent times the multiplier) plus amount yet to be mined. The claimable amount is the 19,687,500 BTC issued through block 839,999 plus the 3.125 BTC reward of block 840,000 itself
++- The actually claimable amount is slightly below the nominal ceiling (burned or unclaimed rewards). The exact value is fixed by the snapshot total
++- Smallest unit: 1 coin = 100,000,000 base units, same as Bitcoin
++- Because the names use "Bitcoin," the unofficial nature of the project is stated next to the names and in the whitepaper
++- Check before launch whether the tickers collide with existing coins or companies (To verify). If they do, propose alternatives to the owner
++
++**Network identifiers (Decided; implemented)**
++
++| Coin | Chain name | Merge slot | P2P port (main / test / regtest) | RPC port (main / test / regtest) | Address prefix (main / test / regtest) |
++| --- | --- | --- | --- | --- | --- |
++| Half | half | 0 | 21302 / 22302 / 23302 | 21202 / 22202 / 23202 | hf / thf / rhf |
++| Quarter | quarter | 1 | 21304 / 22304 / 23304 | 21204 / 22204 / 23204 | qt / tqt / rqt |
++| Dime | dime | 2 | 21310 / 22310 / 23310 | 21210 / 22210 / 23210 | dm / tdm / rdm |
++| Nickel | nickel | 3 | 21320 / 22320 / 23320 | 21220 / 22220 / 23220 | nk / tnk / rnk |
++| Cent | cent | 4 | 21400 / 22400 / 23400 | 21300 / 22300 / 23300 | ct / tct / rct |
++
++- All ports are below 32768, outside the temporary port ranges operating systems hand out (Windows 49152–65535, Linux 32768–60999), so a node never fails to start because the port is briefly taken
++
++- Network magic (4 bytes): the first 4 bytes of `SHA256("coin-series/<chain name>/<environment>")`, where environment is mainnet, testnet or regtest. Confirm no collision with Bitcoin or known forks
++- Legacy address version bytes are also distinct per chain and environment
++- Distinct prefixes per chain prevent sending to an address of the wrong chain
++- RPC ports are never exposed externally
++
++## 4. Source Structure, Chain Parameters and Reward Schedule
++
++One source tree; a runtime option selects one of the five chains.
++
++**Base source**
++
++- Branch from the latest stable release tag of the official Bitcoin Core repository (`https://github.com/bitcoin/bitcoin`) at the time of work
++- MIT License. Keep the original copyright notices
++- Replace the "Bitcoin Core" name in program names, icons and UI text with the project's own name
++
++**Chain selection (Implemented)**
++
++- A new option `-coin=half | quarter | dime | nickel | cent` selects the coin; Bitcoin Core's `-chain=main | test | regtest` selects the environment (5 coins x 3 environments). Without `-coin` the program runs original Bitcoin, which keeps Bitcoin Core's own regression tests usable
++- Separate data directory per chain. The snapshot directory is shared by all five
++- Per-chain values: multiplier, network magic, ports, address prefixes, genesis block, merge slot number
++- Common values: 600-second block interval, 210,000-block halving interval, snapshot verification value, proof of work, difficulty rules, launch reference block
++- Bitcoin's existing rules such as SegWit and Taproot are active from the first block
++- Remove Bitcoin mainnet checkpoints, minimum chain work, assumed-valid block, DNS seeds and fixed seeds. Initially, known node addresses are specified with `-addnode`
++
++**Consensus parameters to add (draft)**
++
++```cpp
++// add to struct Params in src/consensus/params.h
++int64_t nSupplyMultiplier;    // 2, 4, 10, 20, 100
++int nSnapshotHeight;          // 840000
++uint256 hashSnapshotBlock;    // hash of Bitcoin block 840,000
++uint256 hashSnapshotUtxoSet;  // UTXO set verification value for height 840,000 embedded in Bitcoin Core (Section 5)
++uint8_t nMergeSlot;           // merge mining slot 0..4 (Section 7)
++int nBeaconHeight;            // Bitcoin block height used as the launch reference (Section 9)
++uint32_t nChainSigId;         // chain identifier included in transaction signatures (Section 6)
++```
++
++**Reward schedule (draft implementation of the decided rule)**
++
++- Height h on a new chain is treated as Bitcoin height 840,000 + h when computing the reward
++- Heights 1 through 209,999 (209,999 blocks) form the first reward era; the first halving is at height 210,000, then every 210,000 blocks
++- The genesis block (height 0) has a reward of 0
++- Because the multiplier is applied before halving, late-era rewards differ slightly from "Bitcoin reward times multiplier." This is intended
++
++```cpp
++// src/validation.cpp
++CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& p)
++{
++    if (nHeight == 0) return 0;
++    const int virtualHeight = p.nSnapshotHeight + nHeight;      // 840000 + h
++    const int halvings = virtualHeight / p.nSubsidyHalvingInterval;
++    if (halvings >= 64) return 0;
++    CAmount subsidy = 50 * COIN * p.nSupplyMultiplier;          // multiply first, then halve
++    subsidy >>= halvings;
++    return subsidy;
++}
++// check: h=1 -> 840001/210000 = 4 halvings -> 3.125 x multiplier
++//        h=210000 -> 1050000/210000 = 5 halvings -> 1.5625 x multiplier
++```
++
++**Total supply limit**
++
++- Bitcoin Core's `MAX_MONEY` is a fixed constant. Since it must differ per chain, turn it into a function and update all callers
++- Cent chain limit: 2.1 billion x 100,000,000 = 2.1 x 10^17, within the signed 64-bit range (about 9.2 x 10^18)
++- Check for code that skips overflow checks when summing amounts within a transaction because it assumes the limit
++
++```cpp
++// src/consensus/amount.h : function instead of constant
++inline CAmount MaxMoney(const Consensus::Params& p) { return 21000000 * COIN * p.nSupplyMultiplier; }
++inline bool MoneyRange(const CAmount& v, const Consensus::Params& p) { return v >= 0 && v <= MaxMoney(p); }
++```
++
++## 5. Snapshot and Claims
++
++Every node keeps the UTXO snapshot of Bitcoin block 840,000, and holders receive coins through claim transactions containing an ownership proof. There is no separate claim server or website.
++
++**Snapshot (Decided: stored by every node)**
++
++- Basis: the Bitcoin UTXO set as of block 840,000. File size about 10 GB (To verify)
++- One file shared by all five chains. A node downloads it once
++- Verification value: the UTXO set verification value for height 840,000 recorded in `m_assumeutxo_data` in the Bitcoin Core source is written directly into the consensus parameters. It was reviewed by Bitcoin Core developers, so the issuer need not be trusted
++- The node computes the verification value from the snapshot contents itself and starts only if it matches
++- Two values must be distinguished: the hash of the whole distribution file (checks that the downloaded file is identical) and the UTXO set verification value (checks that the contents are correct). Consensus uses the latter
++- Acquisition A: extract from a synced Bitcoin full node with the rollback feature of `dumptxoutset`. Height 840,000 must be specified (otherwise the latest height supported by that version is chosen). Requires hundreds of GB of disk and days of syncing
++- Acquisition B: download a publicly distributed height-840,000 snapshot and check the verification value
++- Distribution: torrent and ordinary download. Node-to-node transfer is not an existing Bitcoin Core feature, so either do not use it or classify it as new development. Provide download, resume and verification steps before first start, consistent with the rule that a node will not start without the snapshot. Since claims have no deadline, provide replication and recovery procedures so the snapshot remains obtainable
++- Lookup structure: a read-only index that finds amount and locking script from an output's txid and vout
++
++**Claim transaction (Proposed)**
++
++- A dedicated transaction version; in a transaction of this version, every input is a claim input
++- An input references a Bitcoin output by txid and vout. The node looks up the amount and locking script in the snapshot
++- Per-input attachment = ownership proof
++- Input value = snapshot amount x chain multiplier
++- Outputs are ordinary outputs. If the total output is less than the total input value, the difference is the fee. A claimant with no coins can pay the fee from the claim
++- Outputs received through a claim become ordinary UTXOs, spendable immediately
++- Claim status (implemented): unclaimed snapshot outputs appear in each chain's coin set through a read-only view of the snapshot; claiming one writes a small marker record into the chain state. The marker is written and removed together with block connection and disconnection, so reorganizations and restarts need no separate bookkeeping. This replaces the 1-bit-per-output table proposed earlier
++
++**Validation order (every node)**
++
++1. Confirm the referenced output exists in the snapshot and look up its amount and locking script
++2. Confirm it has not yet been claimed on this chain. Duplicates within the same block or transaction are rejected
++3. Confirm the ownership proof satisfies the locking script and the signed content matches this transaction
++4. When included in a block, mark it claimed
++
++**Ownership proof (Proposed: generic message signing)**
++
++- Use the BIP-322 message signing format. Because a "message," not a Bitcoin transaction, is signed, the signature cannot be used as a transaction on Bitcoin mainnet
++- The signed message commits to all of the following (Decided requirement)
++    1. A fixed prefix and the rule version
++    2. Chain name and environment (mainnet, testnet, regtest)
++    3. The snapshot verification value
++    4. All claim inputs: each input's txid, vout, amount and locking script
++    5. All receiving outputs
++    6. Transaction version, lock time and other mutable fields
++- Why: if the signature covered only the receiving outputs, a third party could add another output at the same address as an input and divert the difference as fee. Without the chain name, a claim on one chain could be reused on another
++- Separate verification paths: message signatures are verified under Bitcoin's original signing rules. Applying the chain identifier from Section 6 here would make signatures from existing wallets fail
++- Verified: Bitcoin Core v31.1 has no message-signing verification for this format, so it was implemented on Bitcoin Core's script verifier and passes all 62 official test vectors. Which wallets can produce such signatures: To verify. Legacy signed messages (`signmessage`) work for P2PKH outputs
++
++**Claim support scope (to be fixed in the specification)**
++
++| Item | To decide |
++| --- | --- |
++| Address types | Support method for legacy, SegWit, multisig, and Taproot key-path and script-path. Which of the simple and full message signing formats to accept |
++| Time locks | Whether absolute and relative time locks are evaluated against the original Bitcoin state or the new chain state |
++| Immature coinbase | Handling of Bitcoin mining rewards not yet mature at the snapshot |
++| Special outputs | How to claim outputs not representable as addresses and unparseable scripts |
++| Unsupported types | Preserving the claim right and adding support later. Since there is no deadline, the right never expires |
++| Small outputs | How to aggregate small outputs that hit fee or dust policy into one transaction |
++| Transaction format | Field layout, identifier hash computation, maximum size, how ownership proofs count toward block size and script operation limits |
++
++**Additional items to fix in the specification for snapshot storage and proof verdicts**
++
++- A fixed mapping between outputs and claim-status bit numbers: rebuilding the index must map the same output to the same bit
++- Index verification and rebuilding: even with a correct original, a damaged index could return wrong amounts
++- Access method, file locking and corruption handling when five nodes share one file and index
++- Storage: one shared snapshot file (about 9–10 GB) and a small index next to it; per chain only the markers of outputs actually claimed
++- Fix the version and accepted formats of the message signing proposal
++- Message signature verification can return results other than valid or invalid, such as inconclusive or time-conditional. On chain these map only to accept or reject; inconclusive is rejected
++- A rule by which every node rejects unsupported scripts identically
++- Whether signatures from a previous testnet can be reused after a testnet restart. Proposal: include the genesis hash in the signed content to prevent reuse
++- Scope of the promise for unsupported types: only that the claimable record is preserved. Later support requires node operators to adopt new consensus rules and cannot be guaranteed
++
++**Safety requirements (mandatory)**
++
++1. A signature used for a claim must never be reusable as a valid transaction on Bitcoin mainnet. The claimed output may still be unspent on Bitcoin; if this is broken, the claimant's real bitcoin leaks. The most important requirement
++2. The signature must commit to all six items above. Adding or replacing inputs, changing the receiving address, or submitting to another chain or environment must always fail
++3. Double claims of the same output must be impossible
++4. Never build a website that accepts private keys or recovery phrases
++
++**Claim tool (separate program)**
++
++- Input: the Bitcoin outputs to claim (txid, vout, amount, address) and receiving addresses on the new chains. Claiming works without the snapshot file. For ordinary addresses, the locking script is derived from the address. Multisig and special outputs require the original locking script and extra signing data; guide users to obtain these from their own node's snapshot or a Bitcoin block explorer
++- Path A: display the message to sign; the claimant signs it in an existing wallet and pastes the signature. The private key never leaves the wallet
++- Path B: if no supporting wallet is available, the tool signs directly. It must work on a computer disconnected from the internet, with guidance to move the bitcoin to a new address before use
++- Creates and broadcasts claim transactions for all five chains at once. Since the message differs per chain, a signature is needed per chain
++
++**Properties to disclose**
++
++- Claim records are public: anyone can see which bitcoin output's owner received coins at which new address
++- Even if bitcoin was sold after the snapshot, whoever holds the snapshot-time private key holds the claim right
++- Bitcoin held on exchanges cannot be claimed directly by users because the exchange holds the keys
++
++## 6. Transaction Signing Rules
++
++Ordinary transaction signatures include a per-chain identifier so that a signature on one chain cannot pass on Bitcoin or the other four chains.
++
++- Applies to: all ordinary transactions except claim transactions
++- Method: include the chain and environment identifier (network magic) in the signature hash computation. Same principle as the mechanism Bitcoin Cash introduced at its fork
++- Scope of change: all three signature hash computations (legacy, SegWit, Taproot)
++- Result: ordinary transactions on the new chains cannot be signed with existing Bitcoin wallets, only with this project's wallet
++- Exception: claim ownership proofs are message signatures produced by existing wallets and are verified under Bitcoin's original rules (Section 5). Keep the two verification paths clearly separated in code
++- Since the genesis differs, ordinary Bitcoin transactions cannot be replayed anyway because their inputs do not exist. This rule is an additional safeguard on top of that
++
++## 7. Mining: RandomX and Five-Chain Merged Mining
++
++One RandomX computation mines blocks on all five chains at once. Adoption is decided; the details are proposed.
++
++**Proof of work: RandomX**
++
++- The CPU-oriented proof of work used by Monero. Specialized hardware gains little advantage
++- Reference implementation: `https://github.com/tevador/RandomX`
++- BSD 3-Clause license, about 2,080 MiB shared memory in fast mode for mining, about 256 MiB in light mode for verification, Windows build support (all To verify against the original)
++- The block identifier hash remains double SHA-256. RandomX is used only for the proof-of-work check
++
++**RandomX key policy (Proposed)**
++
++- RandomX requires a key. Official guidance is to change the key periodically without letting miners choose it. A permanently fixed key is not used
++- Because the five chains share one hash, the key must be independent of chain height (heights can diverge across chains)
++- Proposal: key = `SHA256("coin-series/randomx" || epoch)`, epoch = header timestamp divided by 2 weeks (1,209,600 seconds)
++- Nodes compute the key from the timestamp in the header, not their own clock, so every node derives the same key
++- To fix and test in the specification: key selection when timestamps straddle an epoch boundary, reorganizations, verification of old headers, attacks that force repeated key cache replacement to slow nodes, and how much a miner can choose the key by adjusting timestamps
++
++**Merged mining (Proposed)**
++
++- The miner builds a block candidate for each of the five chains, combines the five into one Merkle root, and performs proof of work on that root
++- A symmetric structure with no parent chain. The five chains do not reference each other
++
++| Header section | Contents | Size |
++| --- | --- | --- |
++| Body | version, previous block hash, transaction Merkle root, time, difficulty bits | 76 bytes |
++| Proof of work | 3 sibling hashes of the merge tree, nonce | 96 + 8 bytes |
++
++Validation rules:
++
++1. Commitment c = `SHA256d("coin-series/commit" || 76-byte body)`
++2. Merge tree: an 8-leaf Merkle tree. Slots 0..4 hold the commitments of Half, Quarter, Dime, Nickel and Cent; the rest are zero
++3. A chain recomputes root M from its own slot number and the 3 sibling hashes
++4. Valid if `RandomX(key, M || nonce)` is at or below that chain's target
++5. Slot numbers are fixed per chain. A commitment in a different slot is invalid. This prevents one piece of work from producing two blocks on the same chain
++6. Check that the header's difficulty bits match the value computed for that height (Section 8)
++
++```cpp
++// src/pow.cpp (draft)
++bool CheckProofOfWork(const CBlockHeader& h, const Consensus::Params& p)
++{
++    const uint256 commit = CommitHash(h);                                   // tagged hash of the 76-byte body
++    const uint256 root = MergeRoot(commit, p.nMergeSlot, h.vMergeBranch);   // recompute root from 3 siblings
++    const uint256 key = RandomXKey(h.nTime / 1209600);                      // 2-week epoch key
++    const uint256 pow = RandomXHash(key, root, h.nNonce64);
++    arith_uint256 target; bool neg, over;
++    target.SetCompact(h.nBits, &neg, &over);
++    if (neg || over || target == 0 || target > UintToArith256(p.powLimit)) return false;
++    return UintToArith256(pow) <= target;
++}
++```
++
++- When the five chains share the same difficulty, one solution creates five blocks at once and earns all five rewards
++- When difficulties differ, blocks are created only on chains whose target the solution meets. Mining only some chains is permitted by the rules
++- The block identifier hash covers the body and the proof-of-work section
++- To fix in the specification: nonce byte order, internal node hashing of the merge tree, fixed header length and serialization
++- Since the header format differs from Bitcoin, review all code that assumes an 80-byte header (serialization, header relay, compact blocks, block index)
++
++**Mining program (new)**
++
++- Implemented as `cs-miner`: it asks the five nodes for work with `getmergework` (one common header time), builds the merge tree, runs RandomX on multiple threads and calls `submitmergework` on each chain whose target is met
++- Use the same timestamp in all five headers
++- Settings: five reward addresses, number of threads. A default thread limit that accounts for laptop heat
++- Includes a benchmark function (used to calibrate the starting difficulty)
++- Windows binary included
++
++**Remaining limitation**
++
++- An attacker renting large amounts of cloud CPU can overtake a chain run by a single laptop. A common limitation of small chains with no complete defense
++
++## 8. Difficulty Adjustment and Stall Relief
++
++Difficulty adjusts every block, with an added relief rule that makes it progressively easier when no block appears for a long time. Both rules are decided; the parameters are proposed.
++
++**Base adjustment: per-block exponential adjustment**
++
++- Bitcoin's 2,016-block adjustment is not used. On small chains it reacts far too slowly to sudden hash power changes
++- Uses the algorithm Bitcoin Cash introduced in 2020 (aserti3-2d). Difficulty halves when the schedule falls behind the reference by one half-life and doubles when ahead. The half-life is shortened from the original 2 days to around 2 hours (see the simulation below; the value is fixed in the specification)
++
++```latex
++\text{target}_{h} = \text{target}_{\text{start}} \times 2^{\frac{(t_{h-1} - t_{0}) - 600\,(h-1)}{\tau}}
++```
++
++- Use the integer arithmetic of the published reference implementation as is (no floating point)
++- Anchor definition: the reference specification uses the anchor block's parent time, but genesis has no parent. Proposal: the anchor block is height 1, and its parent time is the genesis time (t0 above). Then the target at height 1 is the starting target, and if blocks arrive exactly every 10 minutes the target stays at the starting target. Fix the expected values at heights 1 and 2 and at normal intervals as test vectors. τ is the half-life
++- Starting target: calibrated to the owner's laptop's measured hash rate so that one block appears every 10 minutes. Example: at 2,000 hashes per second, the expected work per block is 1.2 million hashes
++- The minimum difficulty limit is set well below the starting difficulty
++
++**Why the base adjustment alone is insufficient**
++
++- The next block's difficulty is computed from timestamps of blocks already produced. While no block is produced, difficulty does not fall no matter how much time passes
++- If an outside miner raises hash power 1,000-fold and leaves, the remaining laptop needs about 7 days (10 minutes x 1,000) to find the next block
++
++**Stall relief rule (Proposed)**
++
++- If a new block's timestamp is more than 1 hour after the previous block, the target is relaxed according to the excess time (doubling per 30 minutes). Whether it is stepwise or continuous, and its integer arithmetic, are fixed in the specification. Not applied at height 1 (the genesis timestamp may differ from real time)
++
++```latex
++\text{target}_{h}^{\,\text{final}} = \min\left(\text{powLimit},\ \text{target}_{h} \times 2^{\frac{\max(0,\ t_{h} - t_{h-1} - 3600)}{1800}}\right)
++```
++
++- Target (Decided): even after a 1,000-fold hash power inflow and exit, one laptop produces the next block within about 6 hours. With these parameters, relief reaches about 1,000-fold after 6 hours
++- From the relieved block onward, the base adjustment lowers difficulty according to the accumulated schedule delay
++- Against timestamp manipulation (Decided; implemented): the allowed future time limit is shortened from Bitcoin's 2 hours to 10 minutes. Nodes with badly wrong clocks would then reject or be rejected, so clock synchronization guidance is needed
++- Parameters are fixed by simulation: 10x, 100x and 1,000x inflow then exit; long outage then restart; timestamp manipulation attempts. Measure time to first block and subsequent block intervals in each case
++- This rule is newly designed, so it must go through cross-review at the specification stage
++
++**Relief alone does not restore normal speed**
++
++- Relief applies only to the stalled block. The next block starts again from the base difficulty. With a long half-life, blocks keep taking hours each for a long time
++- Simple simulation results (1,000x laptop hash power for 48 hours then exit; median of 120 runs)
++
++| Half-life | Relief rule | Time to first block after exit | Time to return to average interval of 15 minutes or less | Blocks produced during the 48-hour inflow (normal: 288) |
++| --- | --- | --- | --- | --- |
++| 2 days | Off | about 46 hours | about 17 days | 2,872 |
++| 2 days | On | about 4 hours | about 18 days | 2,872 |
++| 12 hours | On | about 4 hours | about 5 days | 999 |
++| 4 hours | On | about 4.5 hours | about 45 hours | 527 |
++| 2 hours | On | about 4.5 hours | about 24 hours | 408 |
++
++- Shortening the half-life speeds recovery and reduces the number of blocks the inflowing party captures in a short time. This is the basis for proposing a half-life of around 2 hours
++- Limitations of this simulation: constant hash power, block timestamps equal to real time, continuous relief, minimum difficulty never reached. Not included: integer rounding, network latency, timestamp manipulation, repeated inflow and exit, normal-time difficulty fluctuation. A shorter half-life increases normal-time fluctuation and the impact of timestamp manipulation, so these must be evaluated together
++
++**Pass criteria and rules to define in the specification**
++
++- Time to first block: mean, 95th and 99th percentile
++- Time to return to an average 10-minute interval
++- Whether blocks cluster or rewards concentrate during recovery
++- Stability under repeated outside miner inflow and exit. Include inflow duration as well as size in test conditions
++- Quantify the advantage of timestamp choice: in the relief zone, shifting the timestamp 10 minutes forward relaxes the target about 1.26-fold. Shortening the future limit only bounds this advantage; it does not eliminate it. Set an acceptable bound, and also test timestamps earlier than the previous block
++- The difficulty bits recorded in the header are the final target including relief. Cumulative chain work is also computed from this final value, so a relaxed block is not credited with the original higher work
++- Even if hash power rises 1,000-fold, difficulty does not immediately rise 1,000-fold. The size of the resulting stall depends on how long the inflow lasted
++
++**Synchronization of the five chains**
++
++- If the five chains use the same starting target and genesis time, and miners use the same timestamp in all five headers, difficulties move in step
++- If some participants mine only some chains, difficulties may diverge per chain. Each chain must still operate correctly on its own
++
++## 9. Fair Start
++
++The genesis block is derived from the hash of a future Bitcoin block announced in advance, so no one, including the issuer, can start mining before the reference block appears (Decided). Propagation differences of seconds to tens of seconds remain, so "exactly the same moment" is not guaranteed.
++
++**Why this is needed**
++
++- If the genesis is known in advance, blocks with future timestamps can be computed beforehand and submitted all at once at launch
++- Setting the genesis timestamp in the future or including a news headline does not prevent this. Those only prove "not created before then," not that no mining happened between publication and launch
++
++**Method (Proposed)**
++
++1. Announce the launch reference Bitcoin block height H together with the software release. H is the Bitcoin height at release plus at least 432 blocks; about 72 hours on average, and the actual time may be shorter or longer
++2. H is recorded in the source as a consensus parameter. That block's hash cannot be known by anyone until the block is mined
++3. The genesis block is derived by a fixed formula from that hash
++    - Coinbase text = `"coin-series/<chain name>/" || reference block hash`
++    - Time = the reference block's timestamp
++    - Difficulty bits = starting target, reward 0, exempt from proof-of-work check
++4. At startup a node takes the reference block hash as input and computes the genesis of all five chains itself. Participants verify the value on their own Bitcoin node or several block explorers
++5. The issuer does not distribute the value later; that would give the issuer a head start
++6. Releases after mining begins hardcode the reference hash and genesis hashes, removing the input step
++
++**To fix in the specification**
++
++- No waiting for confirmations: waiting would let anyone mine in advance during the wait, so the moment the reference block is published is the moment mining opens. In exchange, it must be fixed in advance which genesis is canonical if the reference block is replaced by a Bitcoin reorganization. Proposal: the genesis derived from block H remaining in Bitcoin's final chain is canonical, and blocks mined on a replaced hash are invalid. Announce in advance that roughly the first hour of mining may become invalid. This chooses prevention of precomputation over the safety of waiting for confirmations
++- Bitcoin Core checks the genesis hash against a compiled constant, so the scope of changing this to runtime derivation
++- A node given a wrong hash ends up with a different genesis and cannot join the network; provide an error message telling the user
++- Start the testnet with the same procedure to verify the procedure itself
++
++**What the issuer must do**
++
++- Publish source, binaries, mining instructions and snapshot verification instructions together with the H announcement
++- The issuer starts mining at the same moment with the same public program
++- No rule favors the issuer. Starting difficulty, rewards and claim conditions are identical for all
++- Publish the issuer's five mining reward addresses (Section 13)
++
++## 10. Work Procedure
++
++Steps 0 through 13. Each step proceeds to the next only after the pass criteria in Section 11 are confirmed by actual execution. Commands are drafts for Ubuntu-family Linux; exact dependencies follow `doc/build-unix.md` and `doc/build-windows.md` of the branched version.
++
++**Step 0. Preliminary checks and early tests**
++
++- Check the To-verify items in Section 16 against primary sources
++- Build the original Bitcoin Core and confirm all tests pass
++- Two early tests: whether a Windows cross-build including RandomX works, and whether message signature verification code, once added, verifies signatures per address type and rejects signatures with a different chain name
++- If either fails, the design must change; report to the owner before the main work
++
++```bash
++sudo apt update
++sudo apt install -y build-essential cmake pkgconf python3 git \
++    libevent-dev libboost-dev libsqlite3-dev
++git clone https://github.com/bitcoin/bitcoin.git coin-series
++cd coin-series
++git tag --sort=-v:refname | head        # find the latest stable tag
++git checkout -b series <latest stable tag>
++cmake -B build
++cmake --build build -j"$(nproc)"
++ctest --test-dir build -j"$(nproc)"     # unit tests
++build/test/functional/test_runner.py    # functional tests
++```
++
++**Step 1. Write the consensus specification**
++
++- A separate document fixing every Proposed item in this manual down to the byte level. Before code
++- Include: claim transaction format and exact serialization of the signed message, claim support scope (Section 5 table), claim status storage rules, header and merge tree serialization, RandomX key rules, difficulty anchor and stall relief parameters, genesis derivation formula, full identifier table per chain
++- Write every rule against the standard "do all nodes reach the same verdict on invalid input?"
++- Build a simulation program alongside the difficulty rules to fix parameters
++- Have the finished specification cross-reviewed by another developer or another AI, and report results to the owner
++
++**Step 2. Renaming and five-chain parameters**
++
++- Replace executable, config file and data directory names, and UI text
++- Add the five chains and their testnets and regtests in `src/kernel/chainparams.cpp`, `src/chainparamsbase.cpp`, `src/util/chaintype.*` (file locations may vary by version)
++- Keep Bitcoin mainnet and testnet definitions so existing tests keep working, but make them unselectable in release builds
++
++**Step 3. Rewards and total supply**
++
++- Apply `GetBlockSubsidy` and `MaxMoney` from Section 4
++- Unit tests for rewards and cumulative totals at heights 1, 209,999, 210,000 and 420,000
++
++**Step 4. Difficulty adjustment and stall relief**
++
++- Replace `GetNextWorkRequired` in `src/pow.cpp`, applying stall relief and the future time limit
++- Unit tests with the reference implementation's published test vectors and the Step 1 simulation results
++
++**Step 5. RandomX and merged mining header**
++
++- Include RandomX as a subdirectory and build it together
++- Apply the header format and validation rules from Section 7
++- The riskiest step. Search terms: `CBlockHeader`, `GetHash`, `CheckProofOfWork`, `headers` message handling, compact blocks, block index
++
++**Step 6. Mining program**
++
++- New program behaving as described in Section 7
++
++**Step 7. Transaction signing rules**
++
++- Apply the Section 6 chain identifier to all three signature hash computations. Update wallet signing code as well
++
++**Step 8. Snapshot and claims**
++
++- Snapshot loading and verification value check, lookup index
++- Claim transaction validation, claim status storage and reversal
++- Claim tool
++- Relay policy: size limits and minimum fees for claim transactions
++- During development, inject a mock snapshot of a few dozen outputs per address type into regtest
++
++**Step 9. Fair start structure**
++
++- Apply the Section 9 genesis derivation and reference block input
++
++**Step 10. Integration tests**
++
++- Add the Section 11 tests to Bitcoin Core's functional test framework (`test/functional/`) and pass them all on regtest
++
++**Step 11. Real snapshot and Windows binaries**
++
++- Obtain the snapshot by method A or B of Section 5, check the verification value, compute output count and amount total
++- Measure the hash rate on the owner's laptop and calibrate the starting target
++
++```bash
++sudo apt install -y g++-mingw-w64-x86-64-posix nsis
++make -C depends HOST=x86_64-w64-mingw32 -j"$(nproc)"
++cmake -B build-win --toolchain depends/x86_64-w64-mingw32/toolchain.cmake
++cmake --build build-win -j"$(nproc)"
++```
++
++- Deliverables: node, wallet GUI, command-line tools, mining program, claim tool, and a launcher that starts all five chains at once
++
++**Step 12. Public testnet (Decided: 7 days)**
++
++- Start with the same procedure as mainnet. State that the coins have no value; it may be restarted freely
++- Because the period is short (7 days), deliberately trigger key epoch transitions, sudden difficulty changes, chain reorganizations and every claim type
++- The end decision is based on the Section 11 mainnet launch criteria, not on elapsed time
++
++**Step 13. Mainnet launch**
++
++- After meeting the Section 11 launch criteria and the Section 15 legal review condition, start with the Section 9 procedure
++- Install on the laptop per Section 12 and distribute per Section 13
++
++## 11. Verification Criteria
++
++Each item passes only when confirmed by actual execution. Estimates do not count, and failing tests are never deleted or skipped.
++
++**Basic operation**
++
++- [ ] All unit and functional tests of the original Bitcoin Core pass
++- [ ] The five chains start simultaneously with separate ports and directories
++- [ ] A node of one chain rejects connections from nodes of other chains and environments
++- [ ] A wallet of one chain rejects addresses of other chains
++- [ ] Height 1 rewards are 6.25, 12.5, 31.25, 62.5, 312.5, halving at height 210,000
++- [ ] Claimed amount + mined amount ≤ 21 million x multiplier
++
++**Mining and difficulty**
++
++- [ ] One solution creates blocks on all five chains at once
++- [ ] Blocks with the wrong slot number are rejected. One piece of work cannot create two blocks on one chain
++- [ ] Blocks whose difficulty bits differ from the computed value are rejected
++- [ ] With only some chains succeeding, stopping or reorganizing during merged mining, each chain still operates correctly on its own
++- [ ] Block relay between nodes and initial sync of a new node work
++- [ ] Correct behavior at RandomX key epoch boundaries. Windows and Linux produce identical results
++- [ ] Difficulty reference test vectors match
++- [ ] After 10x, 100x and 1,000x inflow then exit (inflow lasting 6 and 48 hours, including repeated inflow), time to first block and time to return to an average 10-minute interval are within the specification targets
++- [ ] The advantage obtainable through timestamp choice is within the bound set in the specification (both future timestamps and timestamps earlier than the previous block). Cumulative work of relaxed blocks is computed from the final target
++- [ ] One hour of continuous mining on regtest, with rewards credited to five wallets
++
++**Claims**
++
++- [ ] Normal claims per address type: balance = original amount x multiplier − fee
++- [ ] Re-claiming the same output is rejected. Duplicates within a block and conflicts between unconfirmed transactions are handled
++- [ ] Invalid signatures, outputs absent from the snapshot and tampered amounts are rejected
++- [ ] Transactions that add or replace another output at the same address as an input are rejected
++- [ ] Transactions with a substituted receiving address are rejected
++- [ ] Claim transactions from another sister chain or from testnet are rejected
++- [ ] A transaction built on Bitcoin regtest spending the same output with the claim signature is rejected
++- [ ] Success and failure for time locks, multisig and Taproot match the specification's support scope
++- [ ] After a block containing claims is reorganized away, re-claiming succeeds
++- [ ] After a forced shutdown during claim processing, restart and reindex give identical results
++- [ ] Coins received through claims can be sent in ordinary transactions
++- [ ] Ordinary transaction signatures are rejected on other sister chains and on testnet
++
++**Snapshot and launch**
++
++- [ ] The verification value computed from the snapshot contents matches the value embedded in Bitcoin Core. A node will not start with a tampered snapshot
++- [ ] Snapshot output count and amount total computed; total at most 19,687,503.125 BTC
++- [ ] Nodes given the same reference block hash derive the same genesis. Nodes given a different hash do not connect
++
++**Operation and recovery**
++
++- [ ] Install on a clean Windows machine; start all five chains, mine, send
++- [ ] With the laptop mining alone, average block interval is about 10 minutes
++- [ ] Measured memory and storage while running mining, five nodes and snapshot lookup together
++- [ ] Resource usage stays bounded when receiving large volumes of invalid headers and claim transactions
++- [ ] Five wallets and chains restored on another computer from real backups
++
++**Mainnet launch decision**
++
++- All items above pass on regtest
++- The public testnet is started with the same procedure as mainnet and runs for at least 7 days. Outside miners are welcome but not required: three computers (the launch laptop, a second computer and a remote node) mine at the same time to reproduce competition, block propagation and reorganizations
++- At the end of the testnet, remaining defects are graded and reported to the owner. If any defect affecting consensus rules or claimants' assets remains, the mainnet launch is postponed
++- The claim signature safety requirements (Section 5) must pass regression tests, cross-review and the testnet
++- The pre-mainnet legal review in Section 15 is complete
++- The backup and secondary node procedures in Section 12 are documented and a recovery test is complete
++
++**Reporting format to the owner**
++
++- For each step, distinguish passed items, failed or skipped items, and design changes
++- The owner is not a developer; explain at the level of the glossary in Section 17
++
++## 12. Laptop Installation and Operation
++
++One spare laptop of the owner runs the nodes and mining for all five chains. The operating system stays Windows.
++
++**Recommended specs (fix by measurement)**
++
++- Memory: 16 GB recommended. About 2 GB for mining plus five nodes and snapshot lookup. Whether 8 GB suffices must be measured
++- Storage: start with at least 50 GB free. The snapshot original and lookup index take about 20–30 GB; chain data is small at first but grows with transactions and claims, so check periodically
++- Wired internet recommended
++- Pruning (prune) is prohibited: while this laptop is the only node, it must keep the full history so new participants can sync
++
++**Installation**
++
++- One launcher starts the five nodes and the mining program together
++- Registered to start automatically with Windows
++- Mining thread count: adjust for heat and noise. Running a laptop at full load for long periods shortens its life
++- Enable automatic clock synchronization: block timestamp rules are strict, so a wrong clock causes rejection either way
++
++**Windows settings**
++
++- Disable sleep and hibernation; keep running with the lid closed
++- Confirm automatic restart after Windows updates
++- Battery charge limit (manufacturer tool): prevents battery swelling when always plugged in
++
++**Wallet backup (most important)**
++
++- Coin records live on the chain; the keys that can spend them live only in the wallet. Lose the keys and the coins can never be spent
++- Document the backup format, backup commands and restore commands for the five wallets, and actually restore on another computer to confirm
++- Keep at least two backup copies in a different place from the laptop. Encrypt the wallets
++- Safer setup: set the mining reward addresses to a wallet on a separate device, not the laptop. Coins stay safe even if the laptop is hacked
++
++**Chain data backup and secondary node (complete before mainnet)**
++
++- While only one laptop exists, only one copy of the chain history exists
++- Automate periodic backups of the chain data directory
++- Run one more node on another computer. It need not mine, so an everyday computer is enough
++- Keep a copy of the snapshot file on separate storage
++- Document the procedure and test that recovery from backup actually works
++
++**External access**
++
++- While operating alone: no extra settings needed
++- When others join: forward the five P2P ports (21302, 21304, 21310, 21320, 21400) on the router to the laptop
++- Changing home IP address: new participants cannot find a first contact point. Decide the fix (dynamic DNS service, fixed IP from the ISP, adding participant nodes as seeds) at that stage
++- Never expose RPC ports externally; doing so allows remote control of the wallet
++
++**Routine checks**
++
++- Are all five chain heights increasing, and similar to each other
++- Are block intervals around 10 minutes
++- Free disk space, laptop temperature and fan condition
++- While the laptop is off, no blocks are produced but the chain is not damaged. After restart, the first block arrives under the stall relief rule and difficulty then adjusts
++
++## 13. Distribution and Identity
++
++Source and binaries are distributed through a public repository and torrent; the issuer operates under a fixed pseudonym and publishes the mining reward addresses (all Decided).
++
++**Distribution**
++
++- Public repository as the main channel, with the same files distributed via torrent, so distribution continues even if the repository account is suspended
++- Distributed: source, Windows and Linux binaries, snapshot file and verification instructions, node, mining and claim guides, whitepaper
++- Every release file carries a hash and the issuer's signature
++- State the official distribution channels, with a notice that no site asks for private keys or recovery phrases
++
++**Identity**
++
++- Real name not disclosed. One pseudonym and one signing key are used consistently to sign every announcement and release file
++- Pseudonym: Sento Daimon (Decided). GitHub account: sentodaimon
++- Implementer checks: no real name, email or computer name left in commit author fields, build paths, document properties or repository accounts
++- The repository account for distribution is a separate pseudonym-only account (created by the owner)
++
++**Publishing the mining addresses**
++
++- The issuer's five mining reward addresses are listed in the whitepaper and release documents
++- So anyone can check the issuer's mining share on-chain
++- The addresses are public but not linked to the real name. Moving those coins to a real-name account or exchanging them could create a link
++
++**Long-term maintenance**
++
++- Regularly merge Bitcoin Core security fixes and release new versions
++- Consensus rule changes require all nodes to upgrade, so give sufficient advance notice and an activation height
++
++## 14. Exchange (Post-Launch)
++
++Exchange is done as direct peer-to-peer swaps where no operator holds others' coins, and the ratio is presented as a reference quote, not a guarantee (Decided).
++
++**Principle**
++
++- The five chains and Bitcoin share the same script system. A contract combining hash locks and time locks makes both transfers complete together or cancel together
++- Under normal conditions neither side can lose by sending alone, and no third party holds coins
++- Exceptions may occur: transactions not processed before the deadline due to chain stalls, reorganizations, expired refund deadlines, insufficient fees. On small chains, confirmation counts and deadlines must be generous
++- The same method works between bitcoin and the series coins, and among the series coins (e.g. 10 Dime for 100 Cent)
++
++**Components**
++
++- Exchange tool: a program each party runs. Builds on an existing public implementation adapted to the five chains. Automates creation and verification of the lock contracts so that pasting the counterparty's terms (ratio, time lock deadline) creates the contract. Users never write scripts
++- Offer board: a space to post "willing to swap at this rate." Holds no coins and does not settle trades
++- Reference ratio display: Half 2, Quarter 4, Dime 10, Nickel 20, Cent 100 = 1 bitcoin
++
++**Meaning of the reference ratio**
++
++- Guaranteeing fixed-ratio exchange requires reserves, and since all holders can claim free, the reserves required would be enormous, comparable to the entire bitcoin supply. Therefore it is not guaranteed
++- The issuer may post offers at the reference ratio within their own funds, but without a limit the funds would be exhausted
++- The market sets prices; they are likely to fall far below the reference ratio
++
++**Launch condition**
++
++- Before opening the offer board or exchange tool, obtain legal review on whether it constitutes brokerage (Section 15)
++
++## 15. Risks and Legal Considerations
++
++The biggest risks are the safety of claim signatures, the attack vulnerability of a small chain, and Korean virtual asset regulation. Legal content here is not professional advice; check primary sources and consult a lawyer before acting.
++
++**Technical risks**
++
++| Risk | Description | Response |
++| --- | --- | --- |
++| Claim signature abuse | If a claim signature is reused on Bitcoin mainnet, the claimant's real bitcoin leaks | Section 5 safety requirements, Section 11 tests. No launch before passing |
++| Claim interception | A narrow signature scope lets a third party add inputs or change the receiving address | Signature covers all inputs, outputs, chain and environment |
++| Fake claim tools | Third parties distribute fake tools or sites to steal private keys | Official channels, file hashes and signatures, notices |
++| Hash power attacks | Rented hash power used to reverse the chain and double-spend | Wait for enough confirmations when exchanging. No complete defense |
++| Miner inflow and exit | Sudden difficulty changes stall blocks | Per-block adjustment and stall relief |
++| Timestamp manipulation | Stall relief and key epochs depend on block timestamps | Shorter future limit, simulation and cross-review |
++| Single node | Laptop failure loses chain history and wallet keys | Backups, secondary node, recovery tests |
++| Large structural change | Header, proof of work, signatures and claims changed at once; high defect likelihood | Specification first, cross-review, step-by-step tests, public testnet |
++| Post-launch rule changes | Consensus defects cannot be fixed without all nodes upgrading | Run the testnet to find them early while participants are few |
++| Upstream security patches | Bitcoin Core security fixes must be merged continually | Regular merges; an ongoing cost of a long-term project |
++| Snapshot availability | If the snapshot becomes unobtainable, new nodes cannot join | Torrent, ordinary download, kept copies, guide to direct extraction |
++
++**Market risks**
++
++- A price may not form or may fall far below the reference ratio
++- That most early circulating coins are the issuer's mined coins may be read as a premine. Disclose it in advance in the whitepaper and publish the mining addresses
++
++**Legal considerations (Korea; To verify)**
++
++- Act on Reporting and Using Specified Financial Transaction Information: conducting the sale, purchase, exchange, transfer, custody or brokerage of virtual assets as a business requires registration as a virtual asset service provider, and unregistered business is subject to criminal penalties. Check the articles and penalties in the original text
++- Activities that may fall under it: an exchange holding others' coins, continuous or repeated trading as a business, whether an offer board counts as brokerage
++- Activities generally thought unlikely to fall under it: publishing source code, personal mining, free distribution. This cannot be asserted and must be checked
++- Virtual Asset User Protection Act: prohibitions on unfair trading such as market manipulation may apply even to non-providers. Check whether posting reference offers while the issuer holds most coins could be a problem
++- Financial Investment Services and Capital Markets Act: selling with promised investment returns may raise securities issues
++- Taxes: whether and when gains from mining or exchange are taxed must be checked at the time of realization
++- Trademarks: since the "Bitcoin" name is used, state that the project is unofficial; check for trademark issues
++
++**Stage-by-stage legal review conditions (Decided)**
++
++| Stage | What to check before starting |
++| --- | --- |
++| Public testnet | Nothing. State that the coins have no value |
++| Mainnet launch | One lawyer consultation on issuance, mining, free distribution and use of the "Bitcoin" name. Record the outcome and date |
++| Opening offer board or exchange tool | Whether it constitutes brokerage |
++| Issuer disposing of coins or posting reference offers | Taxes and unfair trading rules |
++
++- A stage is not started until its review is complete
++
++**Operating principles**
++
++- No investment solicitation, price forecasts or promises of returns
++- No custody of others' coins or private keys
++
++## 16. Items to Verify Before Work and Open Items
++
++The owner's decisions are complete; the implementer verifies the rest against primary sources.
++
++**Owner decisions**
++
++- [x] Issuer pseudonym: Sento Daimon
++- [ ] Launch reference Bitcoin block height: decided after release preparation is complete, separately for testnet and mainnet
++
++**Implementer verification**
++
++- [ ] Whether the Bitcoin Core source records the UTXO set verification value and block hash for height 840,000, and the value and computation method
++- [ ] The rollback feature of `dumptxoutset`, how to specify the height, and required disk space
++- [ ] Snapshot file size, output count and amount total
++- [ ] Whether BIP-322 generic message signing is in Bitcoin Core, the support range of simple and full formats, and wallet support
++- [ ] RandomX license, memory requirements, light-mode verification speed, official guidance on key changes, Windows cross-build
++- [ ] Reference specification and published test vectors of the difficulty algorithm
++- [ ] Whether the tickers BTCH, BTCQ, BTCD, BTCN, BTCC collide with existing coins or companies
++- [ ] Whether the network magic and ports collide with other known chains
++- [ ] Measured specs and hash rate of the owner's laptop
++
++**Design items to fix in the specification (written as Proposed in the body)**
++
++- [ ] Claim transaction format and serialization of the signed message (Section 5)
++- [ ] The seven claim support scope items (Section 5 table)
++- [ ] Header and merge tree serialization, RandomX key rules (Section 7)
++- [ ] Difficulty anchor, half-life, stall relief parameters, future time limit (Section 8)
++- [ ] Genesis derivation formula and handling of reference block reorganization (Section 9)
++- [ ] Full identifier table for five chains x three environments (Section 3)
++
++## 17. Glossary
++
++Use explanations at this level when reporting to the owner.
++
++| Term | Meaning |
++| --- | --- |
++| Hard fork | Creating a new chain whose rules are incompatible with an existing coin |
++| Node | A program that stores the chain and verifies transactions and blocks, or the computer running it |
++| Block | A unit of record bundling transactions over a period. About one every 10 minutes |
++| Genesis block | The first block of a chain. Fixing it is the start of issuance |
++| Mainnet | The official chain with real value |
++| Testnet | A public test chain with the same rules but valueless coins |
++| Regtest | A test chain that runs only on a developer's computer; blocks can be made instantly |
++| Mining | Competing on computation to create new blocks and receive new coins as a reward |
++| Proof of work | A value showing the computation was actually performed to create a block |
++| Difficulty | The amount of computation needed to create one block. Adjusts automatically to participating hash power |
++| Halving | The point at which the block reward is cut in half. Every 210,000 blocks (about 4 years) |
++| SHA-256 | Bitcoin's mining computation. Specialized miners have an overwhelming advantage |
++| RandomX | A mining computation designed for general-purpose CPUs |
++| Merged mining | Producing blocks on several chains with one computation |
++| 51% attack | An attack by whoever controls more than half the hash power to reverse the chain's history |
++| Reorganization | A valid chain with greater cumulative work appears and replaces the most recent blocks |
++| Snapshot | A record of all holdings at a specific point in time |
++| Unspent output (UTXO) | A chunk of coins not yet spent. A Bitcoin balance is the sum of these chunks |
++| txid, vout | The address of an output: which transaction, and which output within it |
++| Locking script | The condition that determines who can spend an output |
++| Claim | A snapshot-time holder proving ownership and receiving new coins |
++| Private key | A secret value that allows spending coins. If leaked, the coins are lost |
++| Message signing | A way to prove ownership of a key without revealing it |
++| Replay attack | Rebroadcasting a transaction or signature from one chain on another to cause an unintended transfer |
++| Consensus rules | Validity rules every node must follow identically. If nodes judge differently, the chain splits |
++| Port | A numbered communication channel per program within one computer |
++| Seed node | The node a new participant connects to first to obtain a list of other nodes |
++| Peer-to-peer swap | Two people exchanging coins of different chains simultaneously, with no intermediary holding the coins |
++
++## 18. Implementation Status
++
++The consensus rules are fixed byte by byte in `doc/coinseries/spec.md` (consensus specification) in the source repository. Implemented on Bitcoin Core v31.1 and tested:
++
++| Stage | Contents | Status |
++| --- | --- | --- |
++| 1 | Five coins, reward schedule, per-chain money limit | Done |
++| 2 | RandomX proof of work, five-chain merged mining (180-byte header) | Done (RandomX version 1 or 2 still to choose) |
++| 3 | Per-block difficulty (2-hour half-life), stall relief, 10-minute future limit | Done (start difficulty to be measured on the launch laptop) |
++| 4 | Replay protection (chain identifier in every signature hash) | Done |
++| 5 | Snapshot verification and claims (BIP-322 / legacy signed message) | Done (real 840,000 snapshot to be downloaded and verified) |
++| 6 | Genesis from Bitcoin block H (`-beaconheader`), ports below 32768, Windows programs, merged miner `cs-miner` | Done except the Windows run check on the laptop |
++
++Decisions made during implementation:
++- Unprefixed (pre-final) BIP-322 signatures are rejected; claims accept BIP-322 simple / full or a legacy signed message for P2PKH
++- Time-locked ownership proofs are not accepted
++- Every coinbase carries the tag `coin-series` after the height, so no transaction id on these chains can equal a Bitcoin transaction id
++- Claim transactions use version `0x434C4D31`, up to 500 inputs, proofs up to 10,000 bytes
++
+diff --git a/doc/coinseries/whitepaper.md b/doc/coinseries/whitepaper.md
+new file mode 100644
+index 0000000..d4fb411
+--- /dev/null
++++ b/doc/coinseries/whitepaper.md
+@@ -0,0 +1,254 @@
++# Bitcoin Coin Series — Whitepaper
++
++October 7, 2026
++
++Draft. Contents may change until design verification and the public testnet are complete. Items in 〔 〕 will be finalized before launch.
++
++This project is an independent experiment with no official affiliation with Bitcoin (BTC), the Bitcoin Core developers, or any Bitcoin-related organization.
++
++## 1. Summary
++
++The Bitcoin Coin Series is a set of five independent blockchains that keep Bitcoin's transaction system while multiplying the supply by 2, 4, 10, 20 and 100, with a newly designed mining, difficulty and distribution scheme.
++
++- Five coins: Bitcoin Half, Quarter, Dime, Nickel and Cent, named after the US half dollar, quarter, dime, nickel and cent (1/2, 1/4, 1/10, 1/20 and 1/100)
++- Free distribution: anyone who held bitcoin at Bitcoin block 840,000 can prove ownership and receive each of the five coins in proportion to its multiplier. There is no deadline
++- Simultaneous mining: a single computation produces blocks on all five chains and earns all five rewards together
++- Ordinary-computer mining: mining uses general-purpose CPUs rather than specialized hardware
++- Fair start: no premine and no developer allocation. No one, including the issuer, can start mining before the starting reference value is published
++- No exchange listing is pursued, and no price or return is promised
++
++## 2. Background
++
++Bitcoin's supply is fixed at 21 million, so as its value rises, one unit drifts further from everyday amounts.
++
++- Pricing a cup of coffee at 0.000034 BTC is not intuitive
++- Handling many decimal places is error-prone for ordinary users
++
++This can also be addressed within Bitcoin by using sub-unit notation. This project tests a different path: a long-term experiment observing how people receive and use five separate assets with different units, all started at the same moment under the same conditions.
++
++Bitcoin forks with increased supply have existed before, and most have disappeared. This project differs in that:
++
++- It launches five denominations at once rather than a single coin
++- It does not depend on exchange listings
++- One act of mining earns all five coins
++- It does not aim to replace or compete with Bitcoin
++
++The five coins are not sub-units of Bitcoin. Each is a separate asset with its own price. "Two Halves equal one bitcoin" is only the reference implied by the name; no one guarantees it.
++
++## 3. The Five Coins
++
++The five chains differ only in their supply multiplier; all other rules are identical.
++
++| Coin | Ticker | Unit vs. Bitcoin | Multiplier | Block reward (at start) | Supply cap | Claim per 1 BTC held |
++| --- | --- | --- | --- | --- | --- | --- |
++| Bitcoin Half | BTCH | 1/2 | 2 | 6.25 | 42,000,000 | 2 |
++| Bitcoin Quarter | BTCQ | 1/4 | 4 | 12.5 | 84,000,000 | 4 |
++| Bitcoin Dime | BTCD | 1/10 | 10 | 31.25 | 210,000,000 | 10 |
++| Bitcoin Nickel | BTCN | 1/20 | 20 | 62.5 | 420,000,000 | 20 |
++| Bitcoin Cent | BTCC | 1/100 | 100 | 312.5 | 2,100,000,000 | 100 |
++
++**Kept from Bitcoin**
++
++- 10-minute block interval
++- Halving every 210,000 blocks (about 4 years)
++- Transaction and script system, including SegWit and Taproot
++- The smallest unit: one coin divides into 100,000,000 base units
++
++**Changed from Bitcoin**
++
++- Supply and block rewards are multiplied
++- Proof of work: RandomX (CPU-oriented) instead of SHA-256
++- Difficulty adjustment every block instead of every two weeks
++- Simultaneous mining of the five chains
++- Each chain starts from a new genesis block. Bitcoin's transaction history is not carried over; only its ownership snapshot is referenced
++
++**Reward schedule**
++
++- The starting reward is Bitcoin's current block reward of 3.125 times the multiplier
++- Each chain halves for the first time at its own block 210,000, and every 210,000 blocks after that
++- The supply cap is a nominal ceiling combining the claimable amount and the amount yet to be mined. Because some coins will never be claimed, actual circulating supply will be lower
++- Monthly issuance per chain is the equivalent of 13,500 BTC times the multiplier (about 27,000 Half, about 1,350,000 Cent)
++
++## 4. Distribution: Snapshot and Claims
++
++Anyone who held bitcoin at Bitcoin block 840,000 (the fourth halving block, April 2024) can claim the five coins free of charge.
++
++**Principles**
++
++- There is no deadline. Unclaimed amounts never expire and can be claimed at any time
++- The claim amount is the holding at the snapshot times each coin's multiplier. Holding 1 BTC entitles you to 2 Half, 4 Quarter, 10 Dime, 20 Nickel and 100 Cent
++- There is no registration or approval. A claim is an on-chain transaction, verified by every node under the same rules
++- Even if you sold your bitcoin after the snapshot, you can claim as long as you hold the private key from the snapshot time
++
++**How it works**
++
++- Every node keeps the Bitcoin ownership state (the snapshot) at block 840,000
++- The snapshot is verified against a value already recorded in the Bitcoin Core software. Because the issuer did not create that value, the snapshot's contents can be checked without trusting the issuer. The safety of the software itself is a separate matter, open to review through the published source
++- A claimant proves ownership of the bitcoin by signing a message. Because a message, not a Bitcoin transaction, is signed, no bitcoin moves
++- The signature commits to which bitcoin outputs are claimed, on which chain, and to which address. No one else can reuse the signature to change its contents or use it on another chain
++- Each bitcoin output can be claimed only once per chain
++
++**Please note**
++
++- No claim will ever ask you to enter a private key or recovery phrase on a website. Any such site is an impersonation
++- Claims are public. Anyone can see which bitcoin owner received coins at which new address
++- Bitcoin held on an exchange cannot be claimed directly by the user, because the exchange holds the private keys
++- Some special forms of bitcoin holdings may not be claimable at first. Even then, the record of what is claimable is preserved. Adding support later is a goal but cannot be guaranteed, since new rules apply only if node operators adopt them. Supported range: 〔to be finalized before launch〕
++- For safety, consider moving the bitcoin in question to a new address before claiming
++
++## 5. Mining
++
++Mining is done on ordinary computers, and one computation produces blocks on all five chains.
++
++**Proof of work**
++
++- RandomX is used. It is designed for general-purpose CPUs, so specialized hardware gains little advantage
++- Why not Bitcoin's SHA-256: if a few holders of specialized miners joined, ordinary participants' mining would become meaningless, and the chain could be attacked simply by renting hash power
++- For the same reason, merged mining with Bitcoin, which would let Bitcoin miners mine these chains at no extra cost, is not used
++
++**All five rewards at once**
++
++- A miner combines block candidates for the five chains and performs a single computation
++- If the solution meets a chain's difficulty target, a block is created on that chain. When all five chains share the same difficulty, five blocks are created together and all five rewards are earned together
++- As long as miners mine all five together, hash power is not split and the five chains' security moves together. If only some chains are mined or attacked, security may differ between chains
++- The five chains are independent. A problem on one chain does not affect the validity of another
++
++**Difficulty**
++
++- Difficulty is adjusted every block. On chains with few participants, hash power can change sharply, and adjusting only every two weeks could leave blocks stalled for a long time
++- If no block appears for a long time, a rule makes the difficulty progressively easier as time passes. The goal is for the next block to appear within a few hours even after large hash power arrives and then leaves. Returning to the normal 10-minute interval may take longer
++- Parameters: difficulty halves or doubles over a 2-hour half-life of schedule deviation; if no block appears for more than 1 hour, the target becomes twice as easy every further 30 minutes; block times may be at most 10 minutes ahead of the current time. In simulation, after 1,000-fold hash power arrived for 48 hours and left, the next block appeared after about 4.5 hours (median). The starting difficulty is 〔set from measured hash rate before launch〕
++
++**Limitations**
++
++- Chains with few participants are vulnerable to attacks using rented hash power. Changing the proof of work does not remove this risk, and there is no complete defense
++- When receiving large amounts, wait until enough blocks have accumulated
++
++## 6. Fair Start
++
++The chains launch after verification on a public testnet, and the launch conditions, source code and mining method are published in advance. There is no premine or separate allocation for the issuer, and mining is open to everyone under identical conditions from the first block.
++
++**No one can mine before the reference block appears**
++
++- The first block (genesis) of each of the five chains is derived from a future Bitcoin block announced in advance
++- No one in the world can know that Bitcoin block's contents until it is mined, so no one, including the issuer, can mine in advance
++- Reference block height: 〔announced with the release; at least 432 blocks after the release height, about 72 hours on average〕
++- The software is published beforehand. Once the reference block appears, participants can verify its value themselves and start immediately. Block propagation still introduces differences of seconds to tens of seconds. If the reference block is replaced by a Bitcoin reorganization, the replacing block becomes the reference, and blocks mined before that become invalid
++
++**On the issuer's share of mining**
++
++In the early period there may be few or no miners, so the issuer's share of mining may be overwhelmingly high. This is not a privilege granted by design but a consequence of the number of participants, and it will naturally decline as participation grows.
++
++- The issuer starts mining at the same moment, with the same published software
++- No rule favors the issuer. Starting difficulty, rewards and claim conditions are the same for everyone
++- The issuer's mining reward addresses are published. Anyone can verify on-chain how much was mined to these addresses. This does not prove amounts the issuer received through claims or holds at other addresses
++
++| Chain | Issuer's mining reward address |
++| --- | --- |
++| Half | 〔to be listed before launch〕 |
++| Quarter | 〔to be listed before launch〕 |
++| Dime | 〔to be listed before launch〕 |
++| Nickel | 〔to be listed before launch〕 |
++| Cent | 〔to be listed before launch〕 |
++
++**Testnet and mainnet**
++
++- Defect testing happens on a public testnet whose coins have no value, run for at least 7 days with the same start procedure as mainnet. The testnet may be restarted from scratch at any time
++- The mainnet will not be restarted. Defects found on mainnet are fixed through rule improvements
++- The issuer has no power to fix particular blocks or reverse transactions
++
++## 7. Exchange and Value
++
++This project does not guarantee the price of any of the five coins, and a price may never form.
++
++**Reference ratio**
++
++- The reference implied by the names: 2 Half, 4 Quarter, 10 Dime, 20 Nickel, 100 Cent = 1 bitcoin
++- This ratio is only a reference. No one, including the issuer, guarantees exchange at this ratio
++- Why it cannot be guaranteed: since every bitcoin holder can claim for free, exchanging at a fixed ratio for bitcoin would require reserves comparable to the entire bitcoin supply. Free distribution and a guaranteed fixed ratio cannot coexist
++- The market sets prices. Most past forks traded far below the original and then disappeared
++
++**How exchange works**
++
++- No exchange listing is pursued
++- Exchange is assumed to happen directly between individuals. Because the five chains use the same script system as Bitcoin, contracts can be built in which both transfers complete together or are cancelled together
++- In this approach no third party holds anyone's coins. Losses can still occur in situations such as chain stalls, reorganizations, expired time limits or insufficient fees
++- A tool that makes this easy and a space to post offers are post-launch tasks; whether and when they will be provided has not been decided
++
++**The issuer's holdings**
++
++- The issuer obtains coins only through mining and claims, the same ways as any other participant
++- Early on, few people will claim, so most circulating coins will be mined coins, and the issuer may hold most of them. Coins mined to the addresses published in Section 6 can be verified
++
++## 8. How to Participate
++
++Anyone can run a node, mine and claim without permission.
++
++**Distribution channels**
++
++- Official repository: 〔to be listed before launch〕
++- Torrent: 〔to be listed before launch〕
++- Every release file comes with a hash and the issuer's signature. Issuer signing key: 〔to be listed before launch〕
++- Releases from any other source are not from the issuer
++
++**Running a node**
++
++- Binaries are provided for Windows and Linux. You can also build from source
++- A node must download the Bitcoin snapshot (about 10 GB) once. The five chains share one file
++- The snapshot can also be extracted directly from a Bitcoin full node. However it is obtained, the node checks it against the verification value
++- You may run all five chains or only some of them
++
++**Mining**
++
++- Use the mining program provided with the node
++- Ordinary computers are sufficient; mining requires about 2 GB of memory or more
++- Set one reward address per chain
++
++**Claiming**
++
++- Enter the bitcoin holdings you want to claim and your receiving addresses into the claim tool, and it will show a message to sign
++- Sign that message with the Bitcoin wallet you normally use and paste the signature into the tool to create the claim transactions. Your private key never leaves your wallet
++- For wallets that do not support message signing, the tool can also sign directly. In that case, use it on a computer disconnected from the internet, and move your bitcoin to a new address beforehand
++- Fees can be paid out of the claimed amount, so you can claim even if you hold no coins yet
++
++## 9. Risk Disclosure
++
++The five coins may have no value, and any losses from participation are borne by the participant.
++
++| Risk | Description |
++| --- | --- |
++| Value | A price may not form or may fall far below the reference ratio. Most past Bitcoin forks disappeared |
++| Concentration | Early on, the issuer may hold most of the circulating coins |
++| Mining attacks | While participation is low, a third party with rented hash power could reverse recent transactions |
++| Stalls | Sudden changes in hash power may leave blocks absent for hours |
++| Software defects | New software that changes several Bitcoin rules at once. It is tested and reviewed, but freedom from defects cannot be guaranteed |
++| Single operator | Early on, one issuer handles development and node operation. If the issuer stops, development and security fixes may stop |
++| Impersonation | Third parties may try to steal private keys with fake claim tools or sites. Check the official channels and signatures |
++| Key management | If you lose your wallet's keys, the coins are gone forever. No one can recover them |
++| Privacy | Claiming publicly links a bitcoin address to a new address |
++| Regulation | Virtual asset regulations and taxes in each country may apply. Compliance is the participant's own responsibility |
++
++## 10. Operating Principles and Disclaimer
++
++The issuer commits to the following principles.
++
++1. No premine and no allocation for the issuer
++2. No sale of coins, no investment solicitation, and no promise of price or return
++3. No pursuit of exchange listings
++4. No custody of anyone else's coins or private keys
++5. No request to submit private keys or recovery phrases to the issuer or any website. Entering them into the offline claim tool on your own computer is different, and those values are never transmitted
++6. All source code is published, and the issuer's mining addresses are published
++7. The mainnet will not be restarted, and there will be no power to fix particular blocks or reverse transactions
++8. Consensus rule changes are announced in advance with an activation point. Each node operator decides whether to follow new rules
++
++**Issuer**
++
++- Pseudonym: Sento Daimon
++- All announcements and release files are signed with a single signing key. Announcements without this signature are not from the issuer
++
++**Disclaimer**
++
++- This project has no official affiliation with Bitcoin (BTC), the Bitcoin Core developers, or any Bitcoin-related organization. "Bitcoin" in the names refers only to the source of the snapshot and the reference for the units
++- This document is not an investment solicitation and is not legal, tax or investment advice
++- The software is provided as is, and the issuer is not liable for losses arising from its use
++- This project is based on the open source of Bitcoin Core (MIT License) and RandomX
+-- 
+2.43.0
+

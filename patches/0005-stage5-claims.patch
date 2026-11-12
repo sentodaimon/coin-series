@@ -1,0 +1,1673 @@
+From 5c76aa9510eae440cc13d756d1bfd3942229d9ea Mon Sep 17 00:00:00 2001
+From: Sento Daimon <339524263+sentodaimon@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 18:09:13 +0900
+Subject: [PATCH] Coin Series stage 5: claim snapshot and claim transactions
+
+- claim snapshot: Bitcoin Core UTXO snapshot format (dumptxoutset), verified once against the
+  consensus serialized hash (main/test: Bitcoin Core assumeutxo value for height 840,000) and the
+  snapshot block hash; sparse txid index cached next to the file; node refuses to start on
+  main/test without it (-allowmissingsnapshot for development)
+- coins view layer shows unclaimed snapshot outputs as coins (amount x multiplier, sentinel height);
+  claim marker coins in the chainstate record claims atomically and are removed on disconnect
+- claim transaction (version CLM1): only snapshot outputs, all inputs final, no lock time,
+  one proof per input (<= 10,000 bytes), <= 500 inputs; normal transactions cannot spend snapshot outputs
+- ownership proofs: BIP-322 simple / full or legacy signed message (P2PKH) over a message committing
+  to rule version, chain and environment, genesis, snapshot hash and claim txid; verified with
+  Bitcoin's original signature rules; time-locked and unprefixed proofs rejected
+- coinbase must carry the tag 'coin-series' after the height (new txids never equal Bitcoin's)
+- policy: claim version standard, fixed sigop cost per proof
+- RPCs: getsnapshotinfo, getclaimable, createclaim, getclaimmessage, addclaimproof, signclaimwithkey
+- contrib/coinseries/claim_smoke.sh end-to-end test
+---
+ contrib/coinseries/claim_smoke.sh   | 141 +++++++++++
+ contrib/coinseries/tamper_output.py |  28 +++
+ src/CMakeLists.txt                  |   3 +
+ src/chainparams.cpp                 |   6 +
+ src/chainparamsbase.cpp             |   3 +
+ src/coinseries_claim.cpp            | 215 +++++++++++++++++
+ src/coinseries_claim.h              |  54 +++++
+ src/coinseries_snapshot.cpp         | 262 +++++++++++++++++++++
+ src/coinseries_snapshot.h           | 103 +++++++++
+ src/consensus/params.h              |   4 +
+ src/consensus/tx_verify.cpp         |  32 +++
+ src/init.cpp                        |  23 ++
+ src/kernel/chainparams.cpp          |   9 +
+ src/kernel/chainparams.h            |   2 +
+ src/kernel/coinseries.h             |  13 ++
+ src/node/miner.cpp                  |   6 +
+ src/policy/policy.cpp               |   9 +-
+ src/rpc/client.cpp                  |   5 +
+ src/rpc/coinseries.cpp              | 347 ++++++++++++++++++++++++++++
+ src/rpc/register.h                  |   2 +
+ src/validation.cpp                  |  25 +-
+ src/validation.h                    |   4 +
+ 22 files changed, 1293 insertions(+), 3 deletions(-)
+ create mode 100755 contrib/coinseries/claim_smoke.sh
+ create mode 100644 contrib/coinseries/tamper_output.py
+ create mode 100644 src/coinseries_claim.cpp
+ create mode 100644 src/coinseries_claim.h
+ create mode 100644 src/coinseries_snapshot.cpp
+ create mode 100644 src/coinseries_snapshot.h
+ create mode 100644 src/rpc/coinseries.cpp
+
+diff --git a/contrib/coinseries/claim_smoke.sh b/contrib/coinseries/claim_smoke.sh
+new file mode 100755
+index 0000000..17f1a8d
+--- /dev/null
++++ b/contrib/coinseries/claim_smoke.sh
+@@ -0,0 +1,141 @@
++#!/usr/bin/env bash
++# Coin Series claim end-to-end test (regtest).
++#  1. A Bitcoin regtest node (same binary, no -coin) pays outputs to keys we know:
++#     P2PKH, P2SH-P2WPKH, P2WPKH, P2TR, and a P2PKH owned by its wallet (for signmessage).
++#  2. dumptxoutset -> development claim snapshot with its serialized hash.
++#  3. Coin Series regtest nodes load the snapshot and claims are tested:
++#     sign with keys (BIP-322 simple/full), wallet signature (legacy signmessage), double claim,
++#     tampered outputs, proof reuse on another coin, normal tx spending a snapshot output,
++#     block disconnect / reconnect, restart.
++# Usage: contrib/coinseries/claim_smoke.sh <build/bin>
++set -uo pipefail
++BIN=${1:-build/bin}
++BTCDIR=$(mktemp -d); CSDIR=$(mktemp -d)
++FAIL=0
++pass() { echo "PASS  $*"; }
++fail() { echo "FAIL  $*"; FAIL=1; }
++btc() { "$BIN/bitcoin-cli" -datadir="$BTCDIR" -regtest "$@"; }
++cs() { local c=$1; shift; "$BIN/bitcoin-cli" -datadir="$CSDIR" -coin=$c -regtest "$@"; }
++cleanup() {
++  btc stop >/dev/null 2>&1; cs half stop >/dev/null 2>&1; cs quarter stop >/dev/null 2>&1
++  sleep 3; rm -rf "$BTCDIR" "$CSDIR"
++}
++trap cleanup EXIT
++J() { python3 -c "import sys,json;d=json.load(sys.stdin);print($1)"; }
++
++# ---- 1. Bitcoin regtest with known keys ----
++read -r -a WIFS < <(python3 - <<'EOF'
++import os, hashlib
++A='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
++def b58c(b):
++    b=b+hashlib.sha256(hashlib.sha256(b).digest()).digest()[:4]
++    n=int.from_bytes(b,'big'); s=''
++    while n: n,r=divmod(n,58); s=A[r]+s
++    return '1'*(len(b)-len(b.lstrip(b'\0')))+s
++N=0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
++keys=[]
++while len(keys)<5:
++    k=os.urandom(32)
++    if 0<int.from_bytes(k,'big')<N: keys.append(b58c(b'\xef'+k+b'\x01'))
++print(' '.join(keys))
++EOF
++)
++"$BIN/bitcoind" -datadir="$BTCDIR" -regtest -daemon -listen=0 -fallbackfee=0.0001 >/dev/null
++btc -rpcwait createwallet miner >/dev/null
++MINER=$(btc -rpcwallet=miner getnewaddress)
++btc generatetoaddress 110 "$MINER" >/dev/null
++btc createwallet signer >/dev/null
++SIGNADDR=$(btc -rpcwallet=signer getnewaddress "" legacy)
++DESCS=("pkh(${WIFS[0]})" "sh(wpkh(${WIFS[1]}))" "wpkh(${WIFS[2]})" "tr(${WIFS[3]})" "pkh(${WIFS[4]})")
++NAMES=(p2pkh p2sh-p2wpkh p2wpkh p2tr spare-p2pkh)
++ADDRS=()
++for d in "${DESCS[@]}"; do
++  full=$(btc getdescriptorinfo "$d" | J "d['descriptor']")
++  ADDRS+=("$(btc deriveaddresses "$full" | J "d[0]")")
++done
++AMTS=(1 2 3 4 5)
++declare -A TXID VOUT
++locate() { # address txid -> sets TXID/VOUT
++  local v
++  v=$(btc -rpcwallet=miner gettransaction "$2" true true | python3 -c "
++import sys,json
++d=json.load(sys.stdin)
++print([o['n'] for o in d['decoded']['vout'] if o['scriptPubKey'].get('address')=='$1'][0])")
++  TXID[$1]=$2; VOUT[$1]=$v
++}
++for i in 0 1 2 3 4; do T=$(btc -rpcwallet=miner sendtoaddress "${ADDRS[$i]}" "${AMTS[$i]}"); locate "${ADDRS[$i]}" "$T"; done
++T=$(btc -rpcwallet=miner sendtoaddress "$SIGNADDR" 6); locate "$SIGNADDR" "$T"
++btc generatetoaddress 1 "$MINER" >/dev/null
++DUMP=$(btc dumptxoutset "$BTCDIR/snap.dat" latest)
++HASH=$(echo "$DUMP" | J "d['txoutset_hash']")
++echo "snapshot: $(echo "$DUMP" | J "d['coins_written']") outputs, hash $HASH"
++
++# ---- 2. Coin Series nodes with the snapshot ----
++for c in half quarter; do
++  "$BIN/bitcoind" -datadir="$CSDIR" -coin=$c -regtest -daemon -listen=0 -fallbackfee=0.0001 \
++     -claimsnapshot="$BTCDIR/snap.dat" -claimsnapshothash="$HASH" >/dev/null
++done
++sleep 4
++cs half -rpcwait createwallet w >/dev/null; cs quarter -rpcwait createwallet w >/dev/null
++HA=$(cs half getnewaddress); QA=$(cs quarter getnewaddress)
++cs half generatetoaddress 101 "$HA" >/dev/null; cs quarter generatetoaddress 101 "$QA" >/dev/null
++[[ $(cs half getsnapshotinfo | J "d['loaded'] and d['hash_serialized']=='$HASH'") == True ]] && pass "snapshot loaded and verified" || fail "snapshot load"
++
++inp() { echo "{\"txid\":\"${TXID[$1]}\",\"vout\":${VOUT[$1]}}"; }
++A0=${ADDRS[0]}; A1=${ADDRS[1]}; A2=${ADDRS[2]}; A3=${ADDRS[3]}; A4=${ADDRS[4]}
++[[ $(cs half getclaimable "${TXID[$A2]}" "${VOUT[$A2]}" | J "d['found'] and not d['claimed'] and d['claim_amount']==6") == True ]] \
++  && pass "getclaimable: 3 BTC -> 6 Half, unclaimed" || fail "getclaimable"
++
++# ---- 3. Claim four outputs signed with keys (path B) ----
++BAL0=$(cs half getbalance)
++C=$(cs half createclaim "[$(inp $A0),$(inp $A1),$(inp $A2),$(inp $A3)]" "[{\"$HA\":19.999}]")
++HEX=$(echo "$C" | J "d['hex']")
++S=$(cs half signclaimwithkey "$HEX" "[\"${WIFS[0]}\",\"${WIFS[1]}\",\"${WIFS[2]}\",\"${WIFS[3]}\"]")
++[[ $(echo "$S" | J "d['complete']") == True ]] && pass "signclaimwithkey: p2pkh, p2sh-p2wpkh, p2wpkh, p2tr proofs" || { fail "sign: $(echo "$S" | J "d['errors']")"; }
++SIGNED=$(echo "$S" | J "d['hex']")
++
++# Tampered output (redirect to another address) must fail
++TAMPER=$(python3 "$(dirname "$0")/tamper_output.py" "$SIGNED")
++R=$(cs half sendrawtransaction "$TAMPER" 2>&1); echo "$R" | grep -q "claim proof" && pass "tampered output rejected (proof no longer matches)" || fail "tampered: $R"
++# Same proofs on another coin (Quarter) must fail
++R=$(cs quarter sendrawtransaction "$SIGNED" 2>&1); echo "$R" | grep -q "claim proof" && pass "proofs rejected on another coin (proof invalid there)" || fail "quarter: $R"
++
++TX=$(cs half sendrawtransaction "$SIGNED") && pass "claim accepted into mempool" || fail "claim rejected"
++[[ $(cs half getclaimable "${TXID[$A0]}" "${VOUT[$A0]}" | J "d['claimed']") == True ]] && pass "claimed (mempool) visible" || fail "claimed flag"
++cs half generatetoaddress 1 "$HA" >/dev/null
++BAL1=$(cs half getbalance)
++python3 -c "import sys; d=$BAL1-$BAL0; sys.exit(0 if abs(d-(19.999+3.125*2))<1e-8 else 1)" \
++  && pass "claimed 19.999 Half received (1+2+3+4 BTC x2, fee 0.001)" || fail "balance $BAL0 -> $BAL1"
++
++# ---- 4. Double claim ----
++C2=$(cs half createclaim "[$(inp $A0)]" "[{\"$HA\":1.9}]" | J "d['hex']")
++S2=$(cs half signclaimwithkey "$C2" "[\"${WIFS[0]}\"]" | J "d['hex']")
++R=$(cs half sendrawtransaction "$S2" 2>&1); echo "$R" | grep -q "missingorspent\|missing-inputs\|conflict" && pass "double claim rejected ($R)" || fail "double: $R"
++
++# ---- 5. Wallet signature (legacy signmessage) path A ----
++C3=$(cs half createclaim "[{\"txid\":\"${TXID[$SIGNADDR]}\",\"vout\":${VOUT[$SIGNADDR]}}]" "[{\"$HA\":11.99}]")
++HEX3=$(echo "$C3" | J "d['hex']"); MSG3=$(echo "$C3" | J "d['message']")
++SIG3=$(btc -rpcwallet=signer signmessage "$SIGNADDR" "$MSG3")
++P3=$(cs half addclaimproof "$HEX3" 0 "$SIG3") && pass "Bitcoin wallet signmessage proof attached" || fail "addclaimproof"
++cs half sendrawtransaction "$P3" >/dev/null && pass "wallet-signed claim accepted" || fail "wallet-signed claim"
++cs half generatetoaddress 1 "$HA" >/dev/null
++
++# ---- 6. Normal transaction spending a snapshot output ----
++RAW=$(cs half createrawtransaction "[$(inp $A4)]" "[{\"$HA\":1}]")
++R=$(cs half sendrawtransaction "$RAW" 2>&1); echo "$R" | grep -q "spends-unclaimed-snapshot" && pass "normal tx cannot spend snapshot output" || fail "normal tx: $R"
++
++# ---- 7. Disconnect / reconnect the claim block ----
++CLAIMBLOCK=$(cs half gettransaction "$TX" | J "d['blockhash']")
++cs half invalidateblock "$CLAIMBLOCK"
++[[ $(cs half getclaimable "${TXID[$A0]}" "${VOUT[$A0]}" | J "d['claimed']") == True ]] && pass "after disconnect: claim back in mempool" || fail "disconnect"
++cs half reconsiderblock "$CLAIMBLOCK"
++[[ $(cs half gettransaction "$TX" | J "d['confirmations']>0") == True ]] && pass "reconnected" || fail "reconnect"
++
++# ---- 8. Restart: claim records persist ----
++cs half stop >/dev/null; sleep 4
++"$BIN/bitcoind" -datadir="$CSDIR" -coin=half -regtest -daemon -listen=0 -fallbackfee=0.0001 \
++   -claimsnapshot="$BTCDIR/snap.dat" -claimsnapshothash="$HASH" >/dev/null
++sleep 3
++cs half -rpcwait sendrawtransaction "$S2" >/dev/null 2>&1 && fail "double claim after restart accepted" || pass "double claim after restart rejected"
++[[ $(cs half getclaimable "${TXID[$A4]}" "${VOUT[$A4]}" | J "not d['claimed']") == True ]] && pass "unclaimed output still claimable after restart" || fail "unclaimed state"
++exit $FAIL
+diff --git a/contrib/coinseries/tamper_output.py b/contrib/coinseries/tamper_output.py
+new file mode 100644
+index 0000000..d332bb5
+--- /dev/null
++++ b/contrib/coinseries/tamper_output.py
+@@ -0,0 +1,28 @@
++import sys
++# Pay 1 satoshi less on the first output of a serialized (witness) transaction.
++b = bytearray.fromhex(sys.argv[1])
++
++
++def cs(b, i):
++    v = b[i]
++    if v < 0xfd:
++        return v, i + 1
++    if v == 0xfd:
++        return int.from_bytes(b[i + 1:i + 3], 'little'), i + 3
++    if v == 0xfe:
++        return int.from_bytes(b[i + 1:i + 5], 'little'), i + 5
++    return int.from_bytes(b[i + 1:i + 9], 'little'), i + 9
++
++
++i = 4
++if b[i] == 0 and b[i + 1] == 1:
++    i += 2
++n, i = cs(b, i)
++for _ in range(n):
++    i += 36
++    l, i = cs(b, i)
++    i += l + 4
++n, i = cs(b, i)
++v = int.from_bytes(b[i:i + 8], 'little') - 1
++b[i:i + 8] = v.to_bytes(8, 'little')
++print(b.hex())
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index ceb7698..c978ced 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -181,6 +181,8 @@ endif()
+ 
+ # P2P and RPC server functionality used by `bitcoind` and `bitcoin-qt` executables.
+ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
++  coinseries_claim.cpp
++  coinseries_snapshot.cpp
+   addrdb.cpp
+   addrman.cpp
+   banman.cpp
+@@ -256,6 +258,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
+   rpc/external_signer.cpp
+   rpc/fees.cpp
+   rpc/mempool.cpp
++  rpc/coinseries.cpp
+   rpc/mining.cpp
+   rpc/net.cpp
+   rpc/node.cpp
+diff --git a/src/chainparams.cpp b/src/chainparams.cpp
+index 652c372..685cb2c 100644
+--- a/src/chainparams.cpp
++++ b/src/chainparams.cpp
+@@ -48,6 +48,11 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
+ {
+     if (auto value = args.GetBoolArg("-fastprune")) options.fastprune = *value;
+     if (auto value = args.GetBoolArg("-coinseriesasert")) options.coin_series_asert = *value;
++    if (auto value = args.GetArg("-claimsnapshothash")) {
++        auto hash = uint256::FromHex(*value);
++        if (!hash) throw std::runtime_error(strprintf("Invalid -claimsnapshothash %s", *value));
++        options.claim_snapshot_hash = *hash;
++    }
+     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;
+ 
+     for (const std::string& arg : args.GetArgs("-testactivationheight")) {
+@@ -156,4 +161,5 @@ void SelectParams(const ChainType chain)
+     g_coin_series_header = globalChainParams->GetConsensus().nMergeSlot >= 0;
+     // Coin Series: chain identifier mixed into signature hashes (replay protection; 0 for Bitcoin).
+     g_sighash_chain_id = globalChainParams->GetConsensus().nChainSigId;
++    g_coin_series_chain = globalChainParams->GetConsensus().nMergeSlot >= 0;
+ }
+diff --git a/src/chainparamsbase.cpp b/src/chainparamsbase.cpp
+index 51147a6..37ea569 100644
+--- a/src/chainparamsbase.cpp
++++ b/src/chainparamsbase.cpp
+@@ -15,6 +15,9 @@
+ 
+ void SetupChainParamsBaseOptions(ArgsManager& argsman)
+ {
++    argsman.AddArg("-claimsnapshot=<file>", "Coin Series: UTXO snapshot file for claims (default: <datadir>/snapshot/utxo-840000.dat on main and test)", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
++    argsman.AddArg("-claimsnapshothash=<hex>", "Coin Series regtest: serialized UTXO hash of a development claim snapshot", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
++    argsman.AddArg("-allowmissingsnapshot", "Coin Series development: start main/test without the claim snapshot (claims impossible)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+     argsman.AddArg("-coinseriesasert", "Coin Series regtest: use the real difficulty rules (ASERT + stall relief) instead of fixed easiest difficulty (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+     argsman.AddArg("-randomxversion=<n>", "Coin Series development: RandomX version for proof of work, 1 or 2 (default: 1). All nodes of a network must use the same value.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-coin=<coin>", "Coin Series: run the chain of <coin>. Allowed values: " LIST_COIN_NAMES ". Combine with -chain=main, test or regtest. Without -coin the software runs original Bitcoin (for regression testing only).", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+diff --git a/src/coinseries_claim.cpp b/src/coinseries_claim.cpp
+new file mode 100644
+index 0000000..0e467fb
+--- /dev/null
++++ b/src/coinseries_claim.cpp
+@@ -0,0 +1,215 @@
++// Copyright (c) 2026 Sento Daimon
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <coinseries_claim.h>
++
++#include <addresstype.h>
++#include <chainparams.h>
++#include <common/signmessage.h>
++#include <hash.h>
++#include <kernel/coinseries.h>
++#include <pubkey.h>
++#include <script/interpreter.h>
++#include <script/sign.h>
++#include <script/signingprovider.h>
++#include <script/solver.h>
++#include <streams.h>
++#include <tinyformat.h>
++#include <util/strencodings.h>
++
++#include <variant>
++
++namespace {
++const script_verify_flags BIP322_FLAGS =
++    SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_STRICTENC |
++    SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_MINIMALDATA | SCRIPT_VERIFY_CLEANSTACK |
++    SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_NULLDUMMY | SCRIPT_VERIFY_CONST_SCRIPTCODE |
++    SCRIPT_VERIFY_TAPROOT | SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY | SCRIPT_VERIFY_CHECKSEQUENCEVERIFY |
++    SCRIPT_VERIFY_WITNESS_PUBKEYTYPE |
++    // BIP-322 "upgradeable rules": anything they reject would be "inconclusive", which a claim treats as invalid.
++    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM |
++    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS |
++    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE;
++
++uint256 Bip322MessageHash(const std::string& msg)
++{
++    HashWriter hw = TaggedHash("BIP0322-signed-message");
++    hw.write(std::as_bytes(std::span{msg.data(), msg.size()}));
++    return hw.GetSHA256();
++}
++
++CMutableTransaction ToSpend(const std::string& message, const CScript& challenge)
++{
++    CMutableTransaction tx;
++    tx.version = 0;
++    tx.nLockTime = 0;
++    CTxIn in;
++    in.prevout = COutPoint(Txid{}, 0xFFFFFFFF);
++    in.nSequence = 0;
++    const uint256 mh = Bip322MessageHash(message);
++    in.scriptSig = CScript() << OP_0 << std::vector<unsigned char>(mh.begin(), mh.end());
++    tx.vin.push_back(in);
++    tx.vout.emplace_back(0, challenge);
++    return tx;
++}
++
++CMutableTransaction ToSign(const Txid& to_spend_id)
++{
++    CMutableTransaction tx;
++    tx.version = 0;
++    tx.nLockTime = 0;
++    CTxIn in;
++    in.prevout = COutPoint(to_spend_id, 0);
++    in.nSequence = 0;
++    tx.vin.push_back(in);
++    tx.vout.emplace_back(0, CScript() << OP_RETURN);
++    return tx;
++}
++
++bool IsNativeSegwit(const CScript& script)
++{
++    int version;
++    std::vector<unsigned char> program;
++    return script.IsWitnessProgram(version, program) && (version == 0 || version == 1);
++}
++
++bool VerifyBip322(const std::string& message, const CScript& challenge, const CMutableTransaction& to_sign_in, std::string& error)
++{
++    const CMutableTransaction to_spend = ToSpend(message, challenge);
++    const CMutableTransaction& to_sign = to_sign_in;
++    if (to_sign.vin.size() != 1 || to_sign.vin[0].prevout != COutPoint(to_spend.GetHash(), 0)) { error = "proof does not spend the message commitment"; return false; }
++    if (to_sign.vout.size() != 1 || to_sign.vout[0].nValue != 0 || to_sign.vout[0].scriptPubKey != (CScript() << OP_RETURN)) { error = "proof output malformed"; return false; }
++    if (to_sign.version != 0 || to_sign.nLockTime != 0 || to_sign.vin[0].nSequence != 0) { error = "time-locked proofs are not accepted"; return false; }
++    // Bitcoin's original signature rules: no Coin Series chain identifier.
++    SighashChainIdScope bitcoin_rules{0};
++    PrecomputedTransactionData txdata;
++    txdata.Init(to_sign, {to_spend.vout[0]}, /*force=*/true);
++    MutableTransactionSignatureChecker checker(&to_sign, 0, 0, txdata, MissingDataBehavior::FAIL);
++    ScriptError serror;
++    if (!VerifyScript(to_sign.vin[0].scriptSig, challenge, &to_sign.vin[0].scriptWitness, BIP322_FLAGS, checker, &serror)) {
++        error = std::string("proof signature invalid: ") + ScriptErrorString(serror);
++        return false;
++    }
++    return true;
++}
++
++std::string ChainLabel()
++{
++    const auto& params = Params();
++    const int slot = params.GetConsensus().nMergeSlot;
++    std::string coin = "bitcoin";
++    for (const auto& info : COIN_TABLE) {
++        if (info.merge_slot == slot) coin = std::string{info.name};
++    }
++    const auto env = CoinEnvFromChainType(params.GetChainType());
++    return coin + "-" + (env ? std::string{CoinEnvName(*env)} : params.GetChainTypeString());
++}
++} // namespace
++
++std::string ClaimMessage(const CTransaction& tx)
++{
++    const auto& consensus = Params().GetConsensus();
++    return strprintf("Coin Series claim v1\nchain: %s\ngenesis: %s\nsnapshot: %s\ntransaction: %s",
++                     ChainLabel(), consensus.hashGenesisBlock.GetHex(), consensus.hashSnapshotUtxoSet.GetHex(), tx.GetHash().GetHex());
++}
++
++bool VerifyClaimProof(const CTransaction& tx, unsigned int nIn, const CScript& snapshot_script, std::string& error)
++{
++    const auto& stack = tx.vin.at(nIn).scriptWitness.stack;
++    if (stack.size() != 1 || stack[0].empty() || stack[0].size() > COIN_SERIES_MAX_CLAIM_PROOF_SIZE) { error = "claim input must carry exactly one proof"; return false; }
++    if (!tx.vin[nIn].scriptSig.empty()) { error = "claim input scriptSig must be empty"; return false; }
++    const auto format = static_cast<ClaimProofFormat>(stack[0][0]);
++    const std::span<const unsigned char> payload{stack[0].data() + 1, stack[0].size() - 1};
++    const std::string message = ClaimMessage(tx);
++
++    switch (format) {
++    case ClaimProofFormat::LEGACY: {
++        // Legacy signed message: P2PKH outputs only.
++        std::vector<std::vector<unsigned char>> solutions;
++        if (Solver(snapshot_script, solutions) != TxoutType::PUBKEYHASH) { error = "legacy proofs are only for P2PKH outputs"; return false; }
++        if (payload.size() != 65) { error = "legacy proof must be 65 bytes"; return false; }
++        CPubKey pubkey;
++        if (!pubkey.RecoverCompact(MessageHash(message), std::vector<unsigned char>(payload.begin(), payload.end()))) { error = "legacy proof signature invalid"; return false; }
++        if (!std::equal(solutions[0].begin(), solutions[0].end(), PKHash(pubkey).begin())) { error = "legacy proof key does not match the output"; return false; }
++        return true;
++    }
++    case ClaimProofFormat::SIMPLE: {
++        if (!IsNativeSegwit(snapshot_script)) { error = "simple proofs are only for native SegWit / Taproot outputs"; return false; }
++        CMutableTransaction to_sign = ToSign(ToSpend(message, snapshot_script).GetHash());
++        try {
++            SpanReader reader{payload};
++            reader >> to_sign.vin[0].scriptWitness.stack;
++            if (!reader.empty()) { error = "trailing data in proof"; return false; }
++        } catch (const std::exception&) { error = "malformed simple proof"; return false; }
++        return VerifyBip322(message, snapshot_script, to_sign, error);
++    }
++    case ClaimProofFormat::FULL: {
++        CMutableTransaction to_sign;
++        try {
++            SpanReader reader{payload};
++            reader >> TX_WITH_WITNESS(to_sign);
++            if (!reader.empty()) { error = "trailing data in proof"; return false; }
++        } catch (const std::exception&) { error = "malformed full proof"; return false; }
++        return VerifyBip322(message, snapshot_script, to_sign, error);
++    }
++    }
++    error = "unknown proof format";
++    return false;
++}
++
++util::Result<std::vector<unsigned char>> ParseClaimSignature(const std::string& signature, const CScript& snapshot_script)
++{
++    const std::string prefix = signature.substr(0, 3);
++    std::vector<unsigned char> item;
++    if (prefix == "smp" || prefix == "ful") {
++        auto raw = DecodeBase64(signature.substr(3));
++        if (!raw) return util::Error{Untranslated("signature is not valid base64")};
++        item.push_back(static_cast<unsigned char>(prefix == "smp" ? ClaimProofFormat::SIMPLE : ClaimProofFormat::FULL));
++        item.insert(item.end(), raw->begin(), raw->end());
++    } else if (prefix == "pof") {
++        return util::Error{Untranslated("proof-of-funds signatures are not used for claims; sign the claim message with the simple or full format")};
++    } else {
++        auto raw = DecodeBase64(signature);
++        if (!raw) return util::Error{Untranslated("signature is not valid base64")};
++        std::vector<std::vector<unsigned char>> solutions;
++        if (raw->size() == 65 && Solver(snapshot_script, solutions) == TxoutType::PUBKEYHASH) {
++            item.push_back(static_cast<unsigned char>(ClaimProofFormat::LEGACY));
++            item.insert(item.end(), raw->begin(), raw->end());
++        } else {
++            // Unprefixed BIP-322 signatures (pre-final format) are deliberately not accepted.
++            return util::Error{Untranslated("unprefixed signature: use a BIP-322 signature starting with smp or ful, or a legacy signed message for P2PKH")};
++        }
++    }
++    if (item.size() > COIN_SERIES_MAX_CLAIM_PROOF_SIZE) return util::Error{Untranslated("proof too large")};
++    return item;
++}
++
++util::Result<std::vector<unsigned char>> SignClaimProof(const CTransaction& tx, const CScript& snapshot_script, const SigningProvider& provider)
++{
++    const std::string message = ClaimMessage(tx);
++    const CMutableTransaction to_spend = ToSpend(message, snapshot_script);
++    CMutableTransaction to_sign = ToSign(to_spend.GetHash());
++    SighashChainIdScope bitcoin_rules{0};
++    PrecomputedTransactionData txdata;
++    txdata.Init(to_sign, {to_spend.vout[0]}, /*force=*/true);
++    SignatureData sigdata;
++    MutableTransactionSignatureCreator creator(to_sign, 0, 0, &txdata, SIGHASH_DEFAULT);
++    if (!ProduceSignature(provider, creator, snapshot_script, sigdata)) {
++        return util::Error{Untranslated("cannot sign: the provided keys do not control this output")};
++    }
++    std::vector<unsigned char> item;
++    if (IsNativeSegwit(snapshot_script)) {
++        item.push_back(static_cast<unsigned char>(ClaimProofFormat::SIMPLE));
++        DataStream ds{};
++        ds << sigdata.scriptWitness.stack;
++        item.insert(item.end(), UCharCast(ds.data()), UCharCast(ds.data() + ds.size()));
++    } else {
++        UpdateInput(to_sign.vin[0], sigdata);
++        item.push_back(static_cast<unsigned char>(ClaimProofFormat::FULL));
++        DataStream ds{};
++        ds << TX_WITH_WITNESS(to_sign);
++        item.insert(item.end(), UCharCast(ds.data()), UCharCast(ds.data() + ds.size()));
++    }
++    return item;
++}
+diff --git a/src/coinseries_claim.h b/src/coinseries_claim.h
+new file mode 100644
+index 0000000..8ebac56
+--- /dev/null
++++ b/src/coinseries_claim.h
+@@ -0,0 +1,54 @@
++// Copyright (c) 2026 Sento Daimon
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_COINSERIES_CLAIM_H
++#define BITCOIN_COINSERIES_CLAIM_H
++
++#include <primitives/transaction.h>
++#include <script/script.h>
++#include <util/result.h>
++
++#include <string>
++#include <vector>
++
++class SigningProvider;
++
++/**
++ * Coin Series claim transactions.
++ *
++ * A claim transaction (version COIN_SERIES_CLAIM_TX_VERSION) spends only unclaimed snapshot outputs.
++ * Each input carries exactly one witness item: the ownership proof for the snapshot output's script.
++ * The proof is a BIP-322 signature (or, for P2PKH, a legacy signed message) over the claim message,
++ * which commits to the rule version, the chain and environment, the genesis block, the snapshot hash
++ * and the claim transaction id (txid covers version, every input, every output and the lock time;
++ * each input's amount and script are fixed by the committed snapshot).
++ *
++ * Proofs are verified with Bitcoin's original signature rules (no chain identifier), and they are
++ * message signatures, so they can never be valid Bitcoin transactions.
++ *
++ * Proof witness item = format byte || payload:
++ *   0x01 legacy : 65-byte compact signature (P2PKH only), Bitcoin signed message
++ *   0x02 simple : BIP-322 "simple" witness stack, consensus serialized (native SegWit / Taproot)
++ *   0x03 full   : BIP-322 "full" to_sign transaction, consensus serialized (any script)
++ * Time-locked proofs (to_sign version, lock time or sequence not zero) are not accepted.
++ */
++enum class ClaimProofFormat : uint8_t { LEGACY = 1, SIMPLE = 2, FULL = 3 };
++
++/** The exact text every ownership proof of this claim transaction signs (uses the running chain). */
++std::string ClaimMessage(const CTransaction& tx);
++
++/** Consensus: verify the ownership proof of input nIn against the snapshot output script. */
++bool VerifyClaimProof(const CTransaction& tx, unsigned int nIn, const CScript& snapshot_script, std::string& error);
++
++/**
++ * Convert a signature produced by a wallet over ClaimMessage(tx) into a proof witness item:
++ * BIP-322 strings with prefix "smp" / "ful" (unprefixed BIP-322 signatures are rejected), or a legacy
++ * base64 signed message for P2PKH outputs.
++ */
++util::Result<std::vector<unsigned char>> ParseClaimSignature(const std::string& signature, const CScript& snapshot_script);
++
++/** Produce a proof witness item with keys from the provider (the claim tool signs directly). */
++util::Result<std::vector<unsigned char>> SignClaimProof(const CTransaction& tx, const CScript& snapshot_script, const SigningProvider& provider);
++
++#endif // BITCOIN_COINSERIES_CLAIM_H
+diff --git a/src/coinseries_snapshot.cpp b/src/coinseries_snapshot.cpp
+new file mode 100644
+index 0000000..f0bd6b9
+--- /dev/null
++++ b/src/coinseries_snapshot.cpp
+@@ -0,0 +1,262 @@
++// Copyright (c) 2026 Sento Daimon
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <coinseries_snapshot.h>
++
++#include <hash.h>
++#include <kernel/coinseries.h>
++#include <logging.h>
++#include <script/script.h>
++#include <serialize.h>
++#include <streams.h>
++#include <tinyformat.h>
++#include <util/fs.h>
++#include <util/time.h>
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++
++namespace {
++constexpr std::array<uint8_t, 5> SNAPSHOT_MAGIC{'u', 't', 'x', 'o', 0xff};
++constexpr uint16_t SNAPSHOT_VERSION{2};
++constexpr std::array<uint8_t, 8> INDEX_MAGIC{'c', 's', 'i', 'd', 'x', 0, 0, 1};
++//! Transaction groups per index block. ~180 million outputs -> ~140k index entries (~5.6 MB).
++constexpr uint64_t GROUPS_PER_BLOCK{1024};
++constexpr size_t BLOCK_CACHE_SIZE{16};
++constexpr size_t HEADER_SIZE{5 + 2 + 4 + 32 + 8};
++
++struct Header {
++    uint256 base_blockhash;
++    uint64_t coins_count{0};
++};
++
++Header ReadHeader(AutoFile& f)
++{
++    std::array<uint8_t, 5> magic;
++    f >> magic;
++    if (magic != SNAPSHOT_MAGIC) throw std::ios_base::failure("not a UTXO snapshot file");
++    uint16_t version;
++    f >> version;
++    if (version != SNAPSHOT_VERSION) throw std::ios_base::failure(strprintf("unsupported snapshot version %u", version));
++    std::array<uint8_t, 4> network_magic;
++    f >> network_magic;
++    Header h;
++    f >> h.base_blockhash >> h.coins_count;
++    return h;
++}
++
++/** Bitcoin Core's serialized UTXO hash serialization of one output (kernel/coinstats.cpp TxOutSer). */
++void HashCoin(HashWriter& ss, const COutPoint& outpoint, const Coin& coin)
++{
++    ss << outpoint;
++    ss << static_cast<uint32_t>((coin.nHeight << 1) + coin.fCoinBase);
++    ss << coin.out;
++}
++
++fs::path IndexPath(const fs::path& file)
++{
++    return fs::PathFromString(fs::PathToString(file) + ".csidx");
++}
++} // namespace
++
++util::Result<std::unique_ptr<ClaimSnapshot>> ClaimSnapshot::Open(const fs::path& file, const uint256& expected_hash,
++                                                                  const uint256& expected_base, int64_t multiplier)
++{
++    auto snap = std::unique_ptr<ClaimSnapshot>(new ClaimSnapshot());
++    snap->m_path = file;
++    snap->m_multiplier = multiplier;
++
++    AutoFile f{fsbridge::fopen(file, "rb")};
++    if (f.IsNull()) return util::Error{Untranslated(strprintf("Cannot open claim snapshot %s", fs::PathToString(file)))};
++    try {
++        snap->m_file_size = f.size();
++        const Header header = ReadHeader(f);
++        if (!expected_base.IsNull() && header.base_blockhash != expected_base) {
++            return util::Error{Untranslated(strprintf("Claim snapshot is for block %s, expected %s", header.base_blockhash.ToString(), expected_base.ToString()))};
++        }
++
++        // Reuse the cached index when it belongs to this file and this expected hash.
++        const fs::path index_path = IndexPath(file);
++        {
++            AutoFile idx{fsbridge::fopen(index_path, "rb")};
++            if (!idx.IsNull()) {
++                try {
++                    std::array<uint8_t, 8> magic;
++                    uint64_t file_size;
++                    uint256 hash;
++                    idx >> magic >> file_size >> hash;
++                    if (magic == INDEX_MAGIC && file_size == snap->m_file_size && hash == expected_hash) {
++                        Info info;
++                        uint64_t n;
++                        idx >> info.base_blockhash >> info.coins_count >> info.hash_serialized >> info.total_amount >> n;
++                        std::vector<IndexEntry> entries(n);
++                        for (auto& e : entries) idx >> e.first_txid >> e.offset;
++                        snap->m_info = info;
++                        snap->m_index = std::move(entries);
++                        LogInfo("Claim snapshot %s: %u outputs, verified hash %s (cached index)", fs::PathToString(file), info.coins_count, info.hash_serialized.ToString());
++                        return snap;
++                    }
++                } catch (const std::exception&) {
++                    // fall through and rebuild
++                }
++            }
++        }
++
++        // Full pass: verify the serialized hash and build the sparse index.
++        LogInfo("Verifying claim snapshot %s (%u outputs). This reads the whole file once and can take a while...", fs::PathToString(file), header.coins_count);
++        const auto start = SteadyClock::now();
++        HashWriter ss{};
++        Info info;
++        info.base_blockhash = header.base_blockhash;
++        info.coins_count = header.coins_count;
++        uint64_t coins_read = 0, groups = 0;
++        uint256 prev_txid;
++        std::vector<std::pair<uint32_t, Coin>> coins;
++        while (coins_read < header.coins_count) {
++            const uint64_t offset = f.tell();
++            uint256 txid;
++            f >> txid;
++            if (groups > 0 && !(prev_txid < txid)) {
++                return util::Error{Untranslated("Claim snapshot is not ordered by transaction id")};
++            }
++            const uint64_t count = ReadCompactSize(f);
++            if (count == 0 || count > header.coins_count - coins_read) return util::Error{Untranslated("Claim snapshot has an invalid output count")};
++            coins.clear();
++            coins.reserve(count);
++            for (uint64_t i = 0; i < count; ++i) {
++                const uint64_t n = ReadCompactSize(f);
++                if (n > std::numeric_limits<uint32_t>::max()) return util::Error{Untranslated("Claim snapshot has an invalid output index")};
++                Coin coin;
++                f >> coin;
++                if (coin.out.nValue < 0 || coin.out.nValue > BITCOIN_MAX_MONEY) return util::Error{Untranslated("Claim snapshot has an invalid amount")};
++                coins.emplace_back(static_cast<uint32_t>(n), std::move(coin));
++            }
++            std::sort(coins.begin(), coins.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
++            for (const auto& [n, coin] : coins) {
++                HashCoin(ss, COutPoint{Txid::FromUint256(txid), n}, coin);
++                info.total_amount += coin.out.nValue;
++            }
++            if (groups % GROUPS_PER_BLOCK == 0) snap->m_index.push_back({txid, offset});
++            coins_read += count;
++            ++groups;
++            prev_txid = txid;
++        }
++        info.hash_serialized = ss.GetHash();
++        if (info.hash_serialized != expected_hash) {
++            return util::Error{Untranslated(strprintf("Claim snapshot hash %s does not match the consensus value %s", info.hash_serialized.ToString(), expected_hash.ToString()))};
++        }
++        snap->m_info = info;
++        LogInfo("Claim snapshot verified: %u outputs in %u transactions, hash %s, %.1fs", coins_read, groups, info.hash_serialized.ToString(),
++                Ticks<SecondsDouble>(SteadyClock::now() - start));
++
++        // Cache the index (best effort).
++        AutoFile out{fsbridge::fopen(index_path, "wb")};
++        if (!out.IsNull()) {
++            out << INDEX_MAGIC << snap->m_file_size << expected_hash;
++            out << info.base_blockhash << info.coins_count << info.hash_serialized << info.total_amount << uint64_t{snap->m_index.size()};
++            for (const auto& e : snap->m_index) out << e.first_txid << e.offset;
++            if (out.fclose() != 0) LogWarning("Could not write claim snapshot index %s", fs::PathToString(index_path));
++        }
++    } catch (const std::exception& e) {
++        return util::Error{Untranslated(strprintf("Cannot read claim snapshot %s: %s", fs::PathToString(file), e.what()))};
++    }
++    return snap;
++}
++
++std::vector<ClaimSnapshot::Group> ClaimSnapshot::ReadBlock(size_t index) const
++{
++    AssertLockHeld(m_mutex);
++    for (auto it = m_block_cache.begin(); it != m_block_cache.end(); ++it) {
++        if (it->first == index) {
++            m_block_cache.splice(m_block_cache.begin(), m_block_cache, it);
++            return m_block_cache.front().second;
++        }
++    }
++    std::vector<Group> groups;
++    AutoFile f{fsbridge::fopen(m_path, "rb")};
++    if (f.IsNull()) throw std::runtime_error("claim snapshot file disappeared");
++    f.seek(m_index[index].offset, SEEK_SET);
++    const uint64_t end = index + 1 < m_index.size() ? m_index[index + 1].offset : m_file_size;
++    while (static_cast<uint64_t>(f.tell()) < end) {
++        Group g;
++        f >> g.first;
++        const uint64_t count = ReadCompactSize(f);
++        g.second.reserve(count);
++        for (uint64_t i = 0; i < count; ++i) {
++            const uint32_t n = static_cast<uint32_t>(ReadCompactSize(f));
++            Coin coin;
++            f >> coin;
++            g.second.emplace_back(n, std::move(coin));
++        }
++        groups.push_back(std::move(g));
++    }
++    m_block_cache.emplace_front(index, groups);
++    while (m_block_cache.size() > BLOCK_CACHE_SIZE) m_block_cache.pop_back();
++    return groups;
++}
++
++std::optional<Coin> ClaimSnapshot::Lookup(const COutPoint& outpoint) const
++{
++    if (m_index.empty()) return std::nullopt;
++    const uint256 target = outpoint.hash.ToUint256();
++    // Last index block whose first txid <= target.
++    auto it = std::upper_bound(m_index.begin(), m_index.end(), target, [](const uint256& t, const IndexEntry& e) { return t < e.first_txid; });
++    if (it == m_index.begin()) return std::nullopt;
++    const size_t block = std::distance(m_index.begin(), it) - 1;
++    LOCK(m_mutex);
++    try {
++        const auto groups = ReadBlock(block);
++        auto g = std::lower_bound(groups.begin(), groups.end(), target, [](const Group& a, const uint256& t) { return a.first < t; });
++        if (g == groups.end() || g->first != target) return std::nullopt;
++        for (const auto& [n, coin] : g->second) {
++            if (n == outpoint.n) return coin;
++        }
++    } catch (const std::exception& e) {
++        LogError("Claim snapshot read error: %s", e.what());
++    }
++    return std::nullopt;
++}
++
++COutPoint ClaimMarkerOutpoint(const COutPoint& snapshot_outpoint)
++{
++    HashWriter hw = TaggedHash("coin-series/claimed");
++    hw << snapshot_outpoint;
++    return COutPoint{Txid::FromUint256(hw.GetSHA256()), 0};
++}
++
++Coin ClaimMarkerCoin(int height)
++{
++    return Coin{CTxOut{0, CScript() << OP_FALSE}, height, /*fCoinBaseIn=*/false};
++}
++
++std::optional<Coin> CClaimSnapshotView::Synthesize(const COutPoint& outpoint) const
++{
++    const ClaimSnapshot* snap = g_claim_snapshot.get();
++    if (!snap) return std::nullopt;
++    auto coin = snap->Lookup(outpoint);
++    if (!coin) return std::nullopt;
++    if (base->HaveCoin(ClaimMarkerOutpoint(outpoint))) return std::nullopt; // already claimed on this chain
++    Coin synth{CTxOut{coin->out.nValue * snap->Multiplier(), coin->out.scriptPubKey}, COIN_SERIES_CLAIM_COIN_HEIGHT, /*fCoinBaseIn=*/false};
++    return synth;
++}
++
++std::optional<Coin> CClaimSnapshotView::GetCoin(const COutPoint& outpoint) const
++{
++    if (auto coin = base->GetCoin(outpoint)) return coin;
++    return Synthesize(outpoint);
++}
++
++std::optional<Coin> CClaimSnapshotView::PeekCoin(const COutPoint& outpoint) const
++{
++    if (auto coin = base->PeekCoin(outpoint)) return coin;
++    return Synthesize(outpoint);
++}
++
++bool CClaimSnapshotView::HaveCoin(const COutPoint& outpoint) const
++{
++    return base->HaveCoin(outpoint) || Synthesize(outpoint).has_value();
++}
+diff --git a/src/coinseries_snapshot.h b/src/coinseries_snapshot.h
+new file mode 100644
+index 0000000..2f37f13
+--- /dev/null
++++ b/src/coinseries_snapshot.h
+@@ -0,0 +1,103 @@
++// Copyright (c) 2026 Sento Daimon
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_COINSERIES_SNAPSHOT_H
++#define BITCOIN_COINSERIES_SNAPSHOT_H
++
++#include <coins.h>
++#include <consensus/amount.h>
++#include <primitives/transaction.h>
++#include <sync.h>
++#include <uint256.h>
++#include <util/fs.h>
++#include <util/result.h>
++
++#include <cstdint>
++#include <list>
++#include <memory>
++#include <optional>
++#include <utility>
++#include <vector>
++
++/**
++ * Coin Series claim snapshot: the Bitcoin UTXO set at the snapshot height, in Bitcoin Core's
++ * UTXO snapshot file format (dumptxoutset / loadtxoutset, format version 2). One read-only file is
++ * shared by all five chains.
++ *
++ * The file is verified once against the consensus value (the same serialized-hash Bitcoin Core
++ * uses for assumeutxo) and a small sparse index (every Nth transaction group) is written next to it.
++ * Lookups binary-search the index and decode one group block from the file.
++ */
++class ClaimSnapshot
++{
++public:
++    struct Info {
++        uint256 base_blockhash;  //!< Bitcoin block the snapshot was taken at
++        uint64_t coins_count{0};
++        uint256 hash_serialized; //!< verified serialized hash of the UTXO set
++        CAmount total_amount{0}; //!< sum of all output amounts (Bitcoin units)
++    };
++
++    /**
++     * Open and verify a snapshot. expected_base may be null (development snapshots).
++     * Verification and index building read the whole file once; the result is cached in
++     * "<file>.csidx" and reused while file size and expected hash match.
++     */
++    static util::Result<std::unique_ptr<ClaimSnapshot>> Open(const fs::path& file, const uint256& expected_hash,
++                                                             const uint256& expected_base, int64_t multiplier);
++
++    /** Look up an output as it existed in Bitcoin at the snapshot height. */
++    std::optional<Coin> Lookup(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    const Info& GetInfo() const { return m_info; }
++    int64_t Multiplier() const { return m_multiplier; }
++    const fs::path& Path() const { return m_path; }
++
++    struct IndexEntry {
++        uint256 first_txid; //!< txid of the first group in this block (internal byte order)
++        uint64_t offset;    //!< file offset of that group
++    };
++
++private:
++    using Group = std::pair<uint256, std::vector<std::pair<uint32_t, Coin>>>;
++    std::vector<Group> ReadBlock(size_t index) const EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
++
++    fs::path m_path;
++    Info m_info;
++    int64_t m_multiplier{1};
++    uint64_t m_file_size{0};
++    std::vector<IndexEntry> m_index;
++
++    mutable Mutex m_mutex;
++    //! Small cache of recently decoded index blocks (most recent first).
++    mutable std::list<std::pair<size_t, std::vector<Group>>> m_block_cache GUARDED_BY(m_mutex);
++};
++
++/** The snapshot of the running chain (null when claims are not available). Set once at startup. */
++inline std::unique_ptr<ClaimSnapshot> g_claim_snapshot;
++
++/** Outpoint of the marker coin recording that a snapshot output has been claimed on this chain. */
++COutPoint ClaimMarkerOutpoint(const COutPoint& snapshot_outpoint);
++/** Marker coin: zero value, unspendable script (OP_FALSE). */
++Coin ClaimMarkerCoin(int height);
++
++/**
++ * Coins view layer that makes unclaimed snapshot outputs visible as coins:
++ * value = snapshot amount x multiplier, height = COIN_SERIES_CLAIM_COIN_HEIGHT.
++ * A snapshot output is hidden once its claim marker exists in the layer below (the database).
++ * Coins present in the layer below always take precedence.
++ */
++class CClaimSnapshotView final : public CCoinsViewBacked
++{
++public:
++    explicit CClaimSnapshotView(CCoinsView* view) : CCoinsViewBacked(view) {}
++    std::optional<Coin> GetCoin(const COutPoint& outpoint) const override;
++    std::optional<Coin> PeekCoin(const COutPoint& outpoint) const override;
++    bool HaveCoin(const COutPoint& outpoint) const override;
++
++private:
++    std::optional<Coin> Synthesize(const COutPoint& outpoint) const;
++};
++
++#endif // BITCOIN_COINSERIES_SNAPSHOT_H
+diff --git a/src/consensus/params.h b/src/consensus/params.h
+index ebfdc92..ace0dfd 100644
+--- a/src/consensus/params.h
++++ b/src/consensus/params.h
+@@ -94,6 +94,10 @@ struct Params {
+     uint32_t nChainSigId{0};
+     /** Coin Series: RandomX version used for proof of work (1 or 2). Undecided; selectable for testing. */
+     int nRandomXVersion{1};
++    /** Coin Series claims: serialized hash of the Bitcoin UTXO set at the snapshot height (consensus value). */
++    uint256 hashSnapshotUtxoSet{};
++    /** Coin Series claims: Bitcoin block hash at the snapshot height (null = not checked, development snapshots). */
++    uint256 hashSnapshotBlock{};
+     /**
+      * Coin Series difficulty: per-block exponential adjustment (aserti3-2d) anchored at height 1,
+      * whose parent time is the genesis time. 0 = not used (original Bitcoin rules).
+diff --git a/src/consensus/tx_verify.cpp b/src/consensus/tx_verify.cpp
+index 4efed70..2d99099 100644
+--- a/src/consensus/tx_verify.cpp
++++ b/src/consensus/tx_verify.cpp
+@@ -9,6 +9,7 @@
+ #include <consensus/amount.h>
+ #include <consensus/consensus.h>
+ #include <consensus/validation.h>
++#include <kernel/coinseries.h>
+ #include <primitives/transaction.h>
+ #include <script/interpreter.h>
+ #include <util/check.h>
+@@ -147,6 +148,12 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
+     if (tx.IsCoinBase())
+         return nSigOps;
+ 
++    // Coin Series claims: inputs carry ownership proofs (message signatures) instead of input scripts.
++    // Charge a fixed signature-operation cost per proof (proof size itself is limited by consensus).
++    if (g_coin_series_chain && tx.version == COIN_SERIES_CLAIM_TX_VERSION) {
++        return nSigOps + static_cast<int64_t>(tx.vin.size()) * 20;
++    }
++
+     if (flags & SCRIPT_VERIFY_P2SH) {
+         nSigOps += GetP2SHSigOpCount(tx, inputs) * WITNESS_SCALE_FACTOR;
+     }
+@@ -169,6 +176,31 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state,
+                          strprintf("%s: inputs missing/spent", __func__));
+     }
+ 
++    // Coin Series claims: a claim transaction spends only unclaimed snapshot outputs, and only a claim
++    // transaction may spend them. Its proofs are checked with the scripts (CScriptCheck).
++    if (g_coin_series_chain) {
++        const bool is_claim = tx.version == COIN_SERIES_CLAIM_TX_VERSION;
++        if (is_claim) {
++            if (tx.vin.size() > COIN_SERIES_MAX_CLAIM_INPUTS) {
++                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-claim-too-many-inputs");
++            }
++            if (tx.nLockTime != 0) return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-claim-locktime");
++        }
++        for (const CTxIn& txin : tx.vin) {
++            const bool snapshot_coin = inputs.AccessCoin(txin.prevout).nHeight == COIN_SERIES_CLAIM_COIN_HEIGHT;
++            if (snapshot_coin != is_claim) {
++                return state.Invalid(TxValidationResult::TX_CONSENSUS, is_claim ? "bad-claim-input-not-snapshot" : "bad-txns-spends-unclaimed-snapshot");
++            }
++            if (is_claim) {
++                if (txin.nSequence != CTxIn::SEQUENCE_FINAL) return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-claim-sequence");
++                if (!txin.scriptSig.empty() || txin.scriptWitness.stack.size() != 1 ||
++                    txin.scriptWitness.stack[0].empty() || txin.scriptWitness.stack[0].size() > COIN_SERIES_MAX_CLAIM_PROOF_SIZE) {
++                    return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-claim-proof-shape");
++                }
++            }
++        }
++    }
++
+     CAmount nValueIn = 0;
+     for (unsigned int i = 0; i < tx.vin.size(); ++i) {
+         const COutPoint &prevout = tx.vin[i].prevout;
+diff --git a/src/init.cpp b/src/init.cpp
+index fb4b8fa..6fed1b4 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -7,6 +7,9 @@
+ 
+ #include <init.h>
+ 
++#include <coinseries_snapshot.h>
++#include <kernel/coinseries.h>
++
+ #include <kernel/checks.h>
+ 
+ #include <addrman.h>
+@@ -1826,6 +1829,26 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
+ 
+     // ********************************************************* Step 7: load block chain
+ 
++    // Coin Series: open and verify the claim snapshot (shared by all five chains).
++    if (g_coin_series_chain) {
++        const auto& consensus = chainparams.GetConsensus();
++        const fs::path snapshot_path = args.IsArgSet("-claimsnapshot")
++            ? AbsPathForConfigVal(args, args.GetPathArg("-claimsnapshot"), /*net_specific=*/false)
++            : args.GetDataDirBase() / "snapshot" / "utxo-840000.dat";
++        if (consensus.hashSnapshotUtxoSet.IsNull()) {
++            LogInfo("Coin Series: no claim snapshot configured for this network; claims are not available");
++        } else if (!fs::exists(snapshot_path)) {
++            if (chainparams.GetChainType() != ChainType::REGTEST && !args.GetBoolArg("-allowmissingsnapshot", false)) {
++                return InitError(strprintf(_("The claim snapshot %s is missing. Download utxo-840000.dat into that folder (see the manual) and start again."), fs::PathToString(snapshot_path)));
++            }
++            LogWarning("Coin Series: claim snapshot %s not found; claims are not available", fs::PathToString(snapshot_path));
++        } else {
++            auto snapshot = ClaimSnapshot::Open(snapshot_path, consensus.hashSnapshotUtxoSet, consensus.hashSnapshotBlock, consensus.nSupplyMultiplier);
++            if (!snapshot) return InitError(util::ErrorString(snapshot));
++            g_claim_snapshot = std::move(*snapshot);
++        }
++    }
++
+     // cache size calculations
+     node::LogOversizedDbCache(args);
+     const auto [index_cache_sizes, kernel_cache_sizes] = CalculateCacheSizes(args, g_enabled_filter_types.size());
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index 2ae7d68..502a351 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -734,6 +734,15 @@ public:
+         consensus.nChainSigId = 0x43530000u | (uint32_t{info.merge_slot} << 8) | uint32_t(e);
+         // RandomX version (1 or 2): undecided, selectable during development.
+         consensus.nRandomXVersion = randomx_version;
++        // Claim snapshot: Bitcoin UTXO set at block 840,000. The hash is the assumeutxo value reviewed and
++        // published in Bitcoin Core (kernel/chainparams.cpp, mainnet m_assumeutxo_data, height 840,000).
++        if (env == CoinEnv::REGTEST) {
++            consensus.hashSnapshotUtxoSet = opts.claim_snapshot_hash;
++            consensus.hashSnapshotBlock = uint256{};
++        } else {
++            consensus.hashSnapshotUtxoSet = uint256{"a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"};
++            consensus.hashSnapshotBlock = uint256{"0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"};
++        }
+ 
+         // All of Bitcoin's rules (BIP34/65/66, CSV, SegWit, Taproot) are active from the first block.
+         consensus.BIP34Height = 1;
+diff --git a/src/kernel/chainparams.h b/src/kernel/chainparams.h
+index 881fbd7..dbdd591 100644
+--- a/src/kernel/chainparams.h
++++ b/src/kernel/chainparams.h
+@@ -155,6 +155,8 @@ public:
+         bool enforce_bip94{false};
+         //! Coin Series regtest: use the real difficulty rules (ASERT + stall relief) instead of fixed difficulty.
+         bool coin_series_asert{false};
++        //! Coin Series regtest: serialized hash of a development claim snapshot (any Bitcoin regtest dumptxoutset file).
++        uint256 claim_snapshot_hash{};
+     };
+ 
+     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);
+diff --git a/src/kernel/coinseries.h b/src/kernel/coinseries.h
+index 0e7574e..c5cae0e 100644
+--- a/src/kernel/coinseries.h
++++ b/src/kernel/coinseries.h
+@@ -97,4 +97,17 @@ inline std::string_view CoinEnvName(CoinEnv env)
+ 
+ #define LIST_COIN_NAMES "half, quarter, dime, nickel, cent"
+ 
++/** Coin Series claims: transaction version marking a claim transaction (ASCII "CLM1"). */
++static constexpr uint32_t COIN_SERIES_CLAIM_TX_VERSION{0x434C4D31};
++/** Coin Series claims: height given to unclaimed snapshot coins as they appear in the coins view
++ *  (never a real block height; distinct from the mempool's height 0x7FFFFFFF). */
++static constexpr uint32_t COIN_SERIES_CLAIM_COIN_HEIGHT{0x7FFFFFFE};
++/** Coin Series claims: at most this many inputs per claim transaction, and bytes per ownership proof. */
++static constexpr size_t COIN_SERIES_MAX_CLAIM_INPUTS{500};
++static constexpr size_t COIN_SERIES_MAX_CLAIM_PROOF_SIZE{10000};
++/** Coin Series: every coinbase scriptSig must contain this tag (keeps new txids distinct from Bitcoin's). */
++inline constexpr std::string_view COIN_SERIES_COINBASE_TAG{"coin-series"};
++/** True when running a Coin Series chain (claims, coinbase tag). Set once at startup by SelectParams(). */
++inline bool g_coin_series_chain{false};
++
+ #endif // BITCOIN_KERNEL_COINSERIES_H
+diff --git a/src/node/miner.cpp b/src/node/miner.cpp
+index 3b6350d..6d40e0f 100644
+--- a/src/node/miner.cpp
++++ b/src/node/miner.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include <node/miner.h>
+ 
++#include <kernel/coinseries.h>
++
+ #include <chain.h>
+ #include <chainparams.h>
+ #include <coins.h>
+@@ -184,6 +186,10 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
+     // increasing its length would reduce the space they can use and may break
+     // existing clients.
+     coinbaseTx.vin[0].scriptSig = CScript() << nHeight;
++    if (g_coin_series_chain) {
++        // Coin Series consensus: tag right after the height.
++        coinbaseTx.vin[0].scriptSig << std::vector<unsigned char>(COIN_SERIES_COINBASE_TAG.begin(), COIN_SERIES_COINBASE_TAG.end());
++    }
+     if (m_options.include_dummy_extranonce) {
+         // For blocks at heights <= 16, the BIP34-encoded height alone is only
+         // one byte. Consensus requires coinbase scriptSigs to be at least two
+diff --git a/src/policy/policy.cpp b/src/policy/policy.cpp
+index 46ec238..ac2dd93 100644
+--- a/src/policy/policy.cpp
++++ b/src/policy/policy.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include <policy/policy.h>
+ 
++#include <kernel/coinseries.h>
++
+ #include <coins.h>
+ #include <consensus/amount.h>
+ #include <consensus/consensus.h>
+@@ -98,7 +100,9 @@ bool IsStandard(const CScript& scriptPubKey, TxoutType& whichType)
+ 
+ bool IsStandardTx(const CTransaction& tx, const std::optional<unsigned>& max_datacarrier_bytes, bool permit_bare_multisig, const CFeeRate& dust_relay_fee, std::string& reason)
+ {
+-    if (tx.version > TX_MAX_STANDARD_VERSION || tx.version < TX_MIN_STANDARD_VERSION) {
++    // Coin Series claim transactions use their own version; their inputs carry ownership proofs.
++    const bool coin_series_claim = g_coin_series_chain && tx.version == COIN_SERIES_CLAIM_TX_VERSION;
++    if (!coin_series_claim && (tx.version > TX_MAX_STANDARD_VERSION || tx.version < TX_MIN_STANDARD_VERSION)) {
+         reason = "version";
+         return false;
+     }
+@@ -212,6 +216,8 @@ static bool CheckSigopsBIP54(const CTransaction& tx, const CCoinsViewCache& inpu
+  */
+ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
+ {
++    // Coin Series: claim inputs are Bitcoin outputs of any kind; their proofs are bounded by consensus.
++    if (g_coin_series_chain && tx.version == COIN_SERIES_CLAIM_TX_VERSION) return true;
+     if (tx.IsCoinBase()) {
+         return true; // Coinbases don't use vin normally
+     }
+@@ -250,6 +256,7 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
+ 
+ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
+ {
++    if (g_coin_series_chain && tx.version == COIN_SERIES_CLAIM_TX_VERSION) return true;
+     if (tx.IsCoinBase())
+         return true; // Coinbases are skipped
+ 
+diff --git a/src/rpc/client.cpp b/src/rpc/client.cpp
+index f787f20..bb1511a 100644
+--- a/src/rpc/client.cpp
++++ b/src/rpc/client.cpp
+@@ -62,6 +62,11 @@ static const CRPCConvertParam vRPCConvertParams[] =
+     { "utxoupdatepsbt", 1, "descriptors" },
+     { "generatetoaddress", 0, "nblocks" },
+     { "getmergework", 1, "time" },
++    { "getclaimable", 1, "vout" },
++    { "createclaim", 0, "inputs" },
++    { "createclaim", 1, "outputs" },
++    { "addclaimproof", 1, "index" },
++    { "signclaimwithkey", 1, "privkeys" },
+     { "submitmergework", 1, "branch" },
+     { "generatetoaddress", 2, "maxtries" },
+     { "generatetodescriptor", 0, "num_blocks" },
+diff --git a/src/rpc/coinseries.cpp b/src/rpc/coinseries.cpp
+new file mode 100644
+index 0000000..036c007
+--- /dev/null
++++ b/src/rpc/coinseries.cpp
+@@ -0,0 +1,347 @@
++// Copyright (c) 2026 Sento Daimon
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// Coin Series claim RPCs: look up snapshot outputs, build claim transactions,
++// attach ownership proofs (from a wallet signature or by signing with keys).
++
++#include <base58.h>
++#include <chainparams.h>
++#include <coins.h>
++#include <coinseries_claim.h>
++#include <coinseries_snapshot.h>
++#include <core_io.h>
++#include <key.h>
++#include <key_io.h>
++#include <kernel/coinseries.h>
++#include <node/context.h>
++#include <rpc/server.h>
++#include <rpc/server_util.h>
++#include <rpc/util.h>
++#include <script/descriptor.h>
++#include <script/signingprovider.h>
++#include <script/solver.h>
++#include <univalue.h>
++#include <util/strencodings.h>
++#include <validation.h>
++
++#include <set>
++
++using node::NodeContext;
++
++namespace {
++void RequireClaims()
++{
++    if (!g_coin_series_chain) throw JSONRPCError(RPC_METHOD_NOT_FOUND, "only available on Coin Series chains");
++    if (!g_claim_snapshot) throw JSONRPCError(RPC_MISC_ERROR, "the claim snapshot is not loaded on this node");
++}
++
++CMutableTransaction DecodeClaimTx(const UniValue& v)
++{
++    CMutableTransaction mtx;
++    if (!DecodeHexTx(mtx, v.get_str(), /*try_no_witness=*/false, /*try_witness=*/true)) {
++        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed");
++    }
++    if (mtx.version != COIN_SERIES_CLAIM_TX_VERSION) throw JSONRPCError(RPC_INVALID_PARAMETER, "not a claim transaction");
++    return mtx;
++}
++
++Coin SnapshotCoin(const COutPoint& op)
++{
++    auto coin = g_claim_snapshot->Lookup(op);
++    if (!coin) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("%s:%u is not in the claim snapshot", op.hash.GetHex(), op.n));
++    return *coin;
++}
++
++UniValue CoinToJSON(const COutPoint& op, const Coin& coin)
++{
++    UniValue o(UniValue::VOBJ);
++    o.pushKV("txid", op.hash.GetHex());
++    o.pushKV("vout", op.n);
++    o.pushKV("bitcoin_amount", ValueFromAmount(coin.out.nValue));
++    o.pushKV("claim_amount", ValueFromAmount(coin.out.nValue * g_claim_snapshot->Multiplier()));
++    o.pushKV("scriptPubKey", HexStr(coin.out.scriptPubKey));
++    std::vector<std::vector<unsigned char>> sol;
++    o.pushKV("type", GetTxnOutputType(Solver(coin.out.scriptPubKey, sol)));
++    return o;
++}
++
++/** Decode a Bitcoin private key in WIF (mainnet 0x80 or testnet/regtest 0xEF prefix). */
++CKey DecodeBitcoinWif(const std::string& wif)
++{
++    std::vector<unsigned char> data;
++    CKey key;
++    if (!DecodeBase58Check(wif, data, 34) || (data.size() != 33 && data.size() != 34) || (data[0] != 0x80 && data[0] != 0xEF)) {
++        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid Bitcoin private key (WIF)");
++    }
++    const bool compressed = data.size() == 34 && data[33] == 1;
++    key.Set(data.begin() + 1, data.begin() + 33, compressed);
++    if (!key.IsValid()) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid Bitcoin private key");
++    return key;
++}
++
++FlatSigningProvider ProviderForKeys(const std::vector<CKey>& keys)
++{
++    FlatSigningProvider provider;
++    for (const CKey& key : keys) {
++        const std::string wif = EncodeSecret(key); // this chain's encoding, only to build descriptors
++        std::vector<std::string> descs{"combo(" + wif + ")"};
++        if (key.IsCompressed()) descs.push_back("tr(" + wif + ")");
++        for (const auto& d : descs) {
++            FlatSigningProvider keyp;
++            std::string error;
++            auto parsed = Parse(d, keyp, error, /*require_checksum=*/false);
++            if (parsed.size() != 1) throw JSONRPCError(RPC_INTERNAL_ERROR, error);
++            std::vector<CScript> scripts;
++            FlatSigningProvider out;
++            parsed[0]->Expand(0, keyp, scripts, out);
++            provider.Merge(std::move(keyp));
++            provider.Merge(std::move(out));
++        }
++    }
++    return provider;
++}
++} // namespace
++
++static RPCHelpMan getsnapshotinfo()
++{
++    return RPCHelpMan{"getsnapshotinfo",
++        "Coin Series: information about the claim snapshot (the Bitcoin UTXO set at the snapshot height).",
++        {},
++        RPCResult{RPCResult::Type::OBJ, "", "", {
++            {RPCResult::Type::BOOL, "loaded", "whether the snapshot is loaded"},
++            {RPCResult::Type::STR, "path", /*optional=*/true, "snapshot file"},
++            {RPCResult::Type::STR_HEX, "base_blockhash", /*optional=*/true, "Bitcoin block of the snapshot"},
++            {RPCResult::Type::NUM, "outputs", /*optional=*/true, "number of outputs"},
++            {RPCResult::Type::STR_AMOUNT, "bitcoin_total", /*optional=*/true, "total amount in Bitcoin units"},
++            {RPCResult::Type::STR_AMOUNT, "claimable_total", /*optional=*/true, "nominal claimable amount on this chain (x multiplier)"},
++            {RPCResult::Type::STR_HEX, "hash_serialized", /*optional=*/true, "verified UTXO set hash"},
++        }},
++        RPCExamples{HelpExampleCli("getsnapshotinfo", "")},
++        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    UniValue r(UniValue::VOBJ);
++    r.pushKV("loaded", g_claim_snapshot != nullptr);
++    if (g_claim_snapshot) {
++        const auto& info = g_claim_snapshot->GetInfo();
++        r.pushKV("path", fs::PathToString(g_claim_snapshot->Path()));
++        r.pushKV("base_blockhash", info.base_blockhash.GetHex());
++        r.pushKV("outputs", info.coins_count);
++        r.pushKV("bitcoin_total", ValueFromAmount(info.total_amount));
++        r.pushKV("claimable_total", ValueFromAmount(info.total_amount * g_claim_snapshot->Multiplier()));
++        r.pushKV("hash_serialized", info.hash_serialized.GetHex());
++    }
++    return r;
++},
++    };
++}
++
++static RPCHelpMan getclaimable()
++{
++    return RPCHelpMan{"getclaimable",
++        "Coin Series: look up a Bitcoin output in the claim snapshot and whether it is already claimed on this chain.",
++        {
++            {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Bitcoin transaction id"},
++            {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "output index"},
++        },
++        RPCResult{RPCResult::Type::OBJ, "", "", {
++            {RPCResult::Type::BOOL, "found", "whether the output is in the snapshot"},
++            {RPCResult::Type::BOOL, "claimed", /*optional=*/true, "already claimed on this chain (including the mempool)"},
++            {RPCResult::Type::ELISION, "", "snapshot output details"},
++        }},
++        RPCExamples{HelpExampleCli("getclaimable", "\"txid\" 0")},
++        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    RequireClaims();
++    const COutPoint op{Txid::FromUint256(ParseHashV(request.params[0], "txid")), static_cast<uint32_t>(request.params[1].getInt<int>())};
++    UniValue r(UniValue::VOBJ);
++    auto coin = g_claim_snapshot->Lookup(op);
++    r.pushKV("found", coin.has_value());
++    if (!coin) return r;
++    NodeContext& node = EnsureAnyNodeContext(request.context);
++    ChainstateManager& chainman = EnsureChainman(node);
++    const CTxMemPool& mempool = EnsureMemPool(node);
++    bool claimed;
++    {
++        LOCK2(cs_main, mempool.cs);
++        const Coin& view_coin = chainman.ActiveChainstate().CoinsTip().AccessCoin(op);
++        claimed = view_coin.IsSpent() || view_coin.nHeight != COIN_SERIES_CLAIM_COIN_HEIGHT || mempool.isSpent(op);
++    }
++    r.pushKV("claimed", claimed);
++    const UniValue details = CoinToJSON(op, *coin);
++    for (size_t i = 0; i < details.size(); ++i) r.pushKV(details.getKeys()[i], details[i]);
++    return r;
++},
++    };
++}
++
++static RPCHelpMan createclaim()
++{
++    return RPCHelpMan{"createclaim",
++        "Coin Series: create an unsigned claim transaction and the message each owner must sign.\n"
++        "The difference between the claimed amount and the outputs is the fee.",
++        {
++            {"inputs", RPCArg::Type::ARR, RPCArg::Optional::NO, "Bitcoin outputs to claim",
++                {{"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "", {
++                    {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Bitcoin transaction id"},
++                    {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "output index"},
++                }}}},
++            {"outputs", RPCArg::Type::ARR, RPCArg::Optional::NO, "receiving addresses on this chain",
++                {{"", RPCArg::Type::OBJ_USER_KEYS, RPCArg::Optional::OMITTED, "", {
++                    {"address", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "amount"},
++                }}}},
++        },
++        RPCResult{RPCResult::Type::OBJ, "", "", {
++            {RPCResult::Type::STR_HEX, "hex", "unsigned claim transaction"},
++            {RPCResult::Type::STR, "message", "message to sign for every input (BIP-322 or legacy signed message)"},
++            {RPCResult::Type::STR_AMOUNT, "fee", "claimed amount minus outputs"},
++            {RPCResult::Type::ARR, "inputs", "", {{RPCResult::Type::ELISION, "", "snapshot output details"}}},
++        }},
++        RPCExamples{HelpExampleCli("createclaim", "'[{\"txid\":\"...\",\"vout\":0}]' '[{\"hf1...\":0.5}]'")},
++        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    RequireClaims();
++    CMutableTransaction mtx;
++    mtx.version = COIN_SERIES_CLAIM_TX_VERSION;
++    mtx.nLockTime = 0;
++    UniValue details(UniValue::VARR);
++    CAmount total_in = 0;
++    std::set<COutPoint> seen;
++    for (const UniValue& in : request.params[0].get_array().getValues()) {
++        const COutPoint op{Txid::FromUint256(ParseHashO(in, "txid")), static_cast<uint32_t>(in.find_value("vout").getInt<int>())};
++        if (!seen.insert(op).second) throw JSONRPCError(RPC_INVALID_PARAMETER, "duplicate input");
++        const Coin coin = SnapshotCoin(op);
++        mtx.vin.emplace_back(op, CScript{}, uint32_t{CTxIn::SEQUENCE_FINAL});
++        total_in += coin.out.nValue * g_claim_snapshot->Multiplier();
++        details.push_back(CoinToJSON(op, coin));
++    }
++    if (mtx.vin.empty() || mtx.vin.size() > COIN_SERIES_MAX_CLAIM_INPUTS) throw JSONRPCError(RPC_INVALID_PARAMETER, "between 1 and 500 inputs");
++    CAmount total_out = 0;
++    for (const UniValue& out : request.params[1].get_array().getValues()) {
++        for (const std::string& addr : out.getKeys()) {
++            const CTxDestination dest = DecodeDestination(addr);
++            if (!IsValidDestination(dest)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid address for this chain: " + addr);
++            const CAmount amount = AmountFromValue(out.find_value(addr));
++            mtx.vout.emplace_back(amount, GetScriptForDestination(dest));
++            total_out += amount;
++        }
++    }
++    if (mtx.vout.empty()) throw JSONRPCError(RPC_INVALID_PARAMETER, "no outputs");
++    if (total_out > total_in) throw JSONRPCError(RPC_INVALID_PARAMETER, "outputs exceed the claimed amount");
++    UniValue r(UniValue::VOBJ);
++    r.pushKV("hex", EncodeHexTx(CTransaction(mtx)));
++    r.pushKV("message", ClaimMessage(CTransaction(mtx)));
++    r.pushKV("fee", ValueFromAmount(total_in - total_out));
++    r.pushKV("inputs", std::move(details));
++    return r;
++},
++    };
++}
++
++static RPCHelpMan getclaimmessage()
++{
++    return RPCHelpMan{"getclaimmessage",
++        "Coin Series: the message every owner signs for this claim transaction.",
++        {{"hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "claim transaction"}},
++        RPCResult{RPCResult::Type::STR, "", "message"},
++        RPCExamples{HelpExampleCli("getclaimmessage", "\"hex\"")},
++        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    RequireClaims();
++    return ClaimMessage(CTransaction(DecodeClaimTx(request.params[0])));
++},
++    };
++}
++
++static RPCHelpMan addclaimproof()
++{
++    return RPCHelpMan{"addclaimproof",
++        "Coin Series: attach an ownership proof made by a Bitcoin wallet.\n"
++        "The signature is over the claim message: a BIP-322 signature (prefix smp or ful), or a legacy\n"
++        "signed message (signmessage) for P2PKH outputs. It is checked before it is attached.",
++        {
++            {"hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "claim transaction"},
++            {"index", RPCArg::Type::NUM, RPCArg::Optional::NO, "input index"},
++            {"signature", RPCArg::Type::STR, RPCArg::Optional::NO, "signature string from the wallet"},
++        },
++        RPCResult{RPCResult::Type::STR_HEX, "", "claim transaction with the proof attached"},
++        RPCExamples{HelpExampleCli("addclaimproof", "\"hex\" 0 \"smpAkcw...\"")},
++        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    RequireClaims();
++    CMutableTransaction mtx = DecodeClaimTx(request.params[0]);
++    const int index = request.params[1].getInt<int>();
++    if (index < 0 || static_cast<size_t>(index) >= mtx.vin.size()) throw JSONRPCError(RPC_INVALID_PARAMETER, "input index out of range");
++    const Coin coin = SnapshotCoin(mtx.vin[index].prevout);
++    auto item = ParseClaimSignature(request.params[2].get_str(), coin.out.scriptPubKey);
++    if (!item) throw JSONRPCError(RPC_INVALID_PARAMETER, util::ErrorString(item).original);
++    mtx.vin[index].scriptWitness.stack = {*item};
++    std::string error;
++    if (!VerifyClaimProof(CTransaction(mtx), index, coin.out.scriptPubKey, error)) throw JSONRPCError(RPC_VERIFY_ERROR, "proof does not verify: " + error);
++    return EncodeHexTx(CTransaction(mtx));
++},
++    };
++}
++
++static RPCHelpMan signclaimwithkey()
++{
++    return RPCHelpMan{"signclaimwithkey",
++        "Coin Series: sign the ownership proofs of a claim transaction with Bitcoin private keys (WIF).\n"
++        "Use only on a computer you trust, ideally offline, and move the bitcoin to new keys first.",
++        {
++            {"hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "claim transaction"},
++            {"privkeys", RPCArg::Type::ARR, RPCArg::Optional::NO, "Bitcoin private keys in WIF",
++                {{"privkey", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
++        },
++        RPCResult{RPCResult::Type::OBJ, "", "", {
++            {RPCResult::Type::STR_HEX, "hex", "claim transaction with the proofs that could be made"},
++            {RPCResult::Type::BOOL, "complete", "whether every input has a valid proof"},
++            {RPCResult::Type::ARR, "errors", "inputs that could not be signed", {{RPCResult::Type::STR, "", ""}}},
++        }},
++        RPCExamples{HelpExampleCli("signclaimwithkey", "\"hex\" '[\"KxBitcoinWif...\"]'")},
++        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    RequireClaims();
++    CMutableTransaction mtx = DecodeClaimTx(request.params[0]);
++    std::vector<CKey> keys;
++    for (const UniValue& k : request.params[1].get_array().getValues()) keys.push_back(DecodeBitcoinWif(k.get_str()));
++    const FlatSigningProvider provider = ProviderForKeys(keys);
++    UniValue errors(UniValue::VARR);
++    bool complete = true;
++    for (size_t i = 0; i < mtx.vin.size(); ++i) {
++        const Coin coin = SnapshotCoin(mtx.vin[i].prevout);
++        std::string verify_error;
++        if (mtx.vin[i].scriptWitness.stack.size() == 1 && VerifyClaimProof(CTransaction(mtx), i, coin.out.scriptPubKey, verify_error)) continue;
++        auto item = SignClaimProof(CTransaction(mtx), coin.out.scriptPubKey, provider);
++        if (!item) {
++            complete = false;
++            errors.push_back(strprintf("input %u: %s", i, util::ErrorString(item).original));
++            continue;
++        }
++        mtx.vin[i].scriptWitness.stack = {*item};
++        if (!VerifyClaimProof(CTransaction(mtx), i, coin.out.scriptPubKey, verify_error)) {
++            complete = false;
++            errors.push_back(strprintf("input %u: %s", i, verify_error));
++        }
++    }
++    UniValue r(UniValue::VOBJ);
++    r.pushKV("hex", EncodeHexTx(CTransaction(mtx)));
++    r.pushKV("complete", complete);
++    r.pushKV("errors", std::move(errors));
++    return r;
++},
++    };
++}
++
++void RegisterCoinSeriesRPCCommands(CRPCTable& t)
++{
++    static const CRPCCommand commands[]{
++        {"coinseries", &getsnapshotinfo},
++        {"coinseries", &getclaimable},
++        {"coinseries", &createclaim},
++        {"coinseries", &getclaimmessage},
++        {"coinseries", &addclaimproof},
++        {"coinseries", &signclaimwithkey},
++    };
++    for (const auto& c : commands) t.appendCommand(c.name, &c);
++}
+diff --git a/src/rpc/register.h b/src/rpc/register.h
+index 8d3089a..4fe29a7 100644
+--- a/src/rpc/register.h
++++ b/src/rpc/register.h
+@@ -12,6 +12,7 @@
+ class CRPCTable;
+ 
+ void RegisterBlockchainRPCCommands(CRPCTable &tableRPC);
++void RegisterCoinSeriesRPCCommands(CRPCTable&);
+ void RegisterFeeRPCCommands(CRPCTable&);
+ void RegisterMempoolRPCCommands(CRPCTable&);
+ void RegisterMiningRPCCommands(CRPCTable &tableRPC);
+@@ -26,6 +27,7 @@ void RegisterTxoutProofRPCCommands(CRPCTable&);
+ static inline void RegisterAllCoreRPCCommands(CRPCTable &t)
+ {
+     RegisterBlockchainRPCCommands(t);
++    RegisterCoinSeriesRPCCommands(t);
+     RegisterFeeRPCCommands(t);
+     RegisterMempoolRPCCommands(t);
+     RegisterMiningRPCCommands(t);
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 54ee12a..ce1b00e 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -7,6 +7,10 @@
+ 
+ #include <validation.h>
+ 
++#include <coinseries_claim.h>
++#include <coinseries_snapshot.h>
++#include <kernel/coinseries.h>
++
+ #include <arith_uint256.h>
+ #include <chain.h>
+ #include <checkqueue.h>
+@@ -1861,12 +1865,13 @@ CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
+ 
+ CoinsViews::CoinsViews(DBParams db_params, CoinsViewOptions options)
+     : m_dbview{std::move(db_params), std::move(options)},
+-      m_catcherview(&m_dbview) {}
++      m_catcherview(&m_dbview),
++      m_claimview(&m_catcherview) {}
+ 
+ void CoinsViews::InitCache()
+ {
+     AssertLockHeld(::cs_main);
+-    m_cacheview = std::make_unique<CCoinsViewCache>(&m_catcherview);
++    m_cacheview = std::make_unique<CCoinsViewCache>(&m_claimview);
+     m_connect_block_view = std::make_unique<CoinsViewOverlay>(&*m_cacheview);
+ }
+ 
+@@ -2015,6 +2020,10 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
+             txundo.vprevout.emplace_back();
+             bool is_spent = inputs.SpendCoin(txin.prevout, &txundo.vprevout.back());
+             assert(is_spent);
++            // Coin Series: record that this snapshot output is now claimed on this chain.
++            if (g_coin_series_chain && txundo.vprevout.back().nHeight == COIN_SERIES_CLAIM_COIN_HEIGHT) {
++                inputs.AddCoin(ClaimMarkerOutpoint(txin.prevout), ClaimMarkerCoin(nHeight), /*possible_overwrite=*/false);
++            }
+         }
+     }
+     // add outputs
+@@ -2022,6 +2031,12 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
+ }
+ 
+ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
++    if (g_coin_series_chain && ptxTo->version == COIN_SERIES_CLAIM_TX_VERSION) {
++        // Coin Series claim: ownership proof over the claim message, verified with Bitcoin's original rules.
++        std::string error;
++        if (VerifyClaimProof(*ptxTo, nIn, m_tx_out.scriptPubKey, error)) return std::nullopt;
++        return std::make_pair(SCRIPT_ERR_UNKNOWN_ERROR, strprintf("claim proof of input %i of %s: %s", nIn, ptxTo->GetHash().ToString(), error));
++    }
+     const CScript &scriptSig = ptxTo->vin[nIn].scriptSig;
+     const CScriptWitness *witness = &ptxTo->vin[nIn].scriptWitness;
+     ScriptError error{SCRIPT_ERR_UNKNOWN_ERROR};
+@@ -2243,9 +2258,12 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
+             for (unsigned int j = tx.vin.size(); j > 0;) {
+                 --j;
+                 const COutPoint& out = tx.vin[j].prevout;
++                const bool claimed_snapshot_coin = g_coin_series_chain && txundo.vprevout[j].nHeight == COIN_SERIES_CLAIM_COIN_HEIGHT;
+                 int res = ApplyTxInUndo(std::move(txundo.vprevout[j]), view, out);
+                 if (res == DISCONNECT_FAILED) return DISCONNECT_FAILED;
+                 fClean = fClean && res != DISCONNECT_UNCLEAN;
++                // Coin Series: the snapshot output becomes unclaimed again.
++                if (claimed_snapshot_coin && !view.SpendCoin(ClaimMarkerOutpoint(out))) fClean = false;
+             }
+             // At this point, all of txundo.vprevout should have been moved out.
+         }
+@@ -4206,6 +4224,9 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
+     if (DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_HEIGHTINCB))
+     {
+         CScript expect = CScript() << nHeight;
++        // Coin Series: the height is followed by the tag "coin-series", so no coinbase on these chains
++        // can ever reproduce a Bitcoin transaction id (snapshot outputs keep unique outpoints).
++        if (g_coin_series_chain) expect << std::vector<unsigned char>(COIN_SERIES_COINBASE_TAG.begin(), COIN_SERIES_COINBASE_TAG.end());
+         if (block.vtx[0]->vin[0].scriptSig.size() < expect.size() ||
+             !std::equal(expect.begin(), expect.end(), block.vtx[0]->vin[0].scriptSig.begin())) {
+             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-height", "block height mismatch in coinbase");
+diff --git a/src/validation.h b/src/validation.h
+index 7aeaafe..e710833 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -11,6 +11,7 @@
+ #include <chain.h>
+ #include <checkqueue.h>
+ #include <coins.h>
++#include <coinseries_snapshot.h>
+ #include <consensus/amount.h>
+ #include <cuckoocache.h>
+ #include <deploymentstatus.h>
+@@ -486,6 +487,9 @@ public:
+     //! This view wraps access to the leveldb instance and handles read errors gracefully.
+     CCoinsViewErrorCatcher m_catcherview GUARDED_BY(cs_main);
+ 
++    //! Coin Series: makes unclaimed snapshot outputs visible as coins (pass-through without a snapshot).
++    CClaimSnapshotView m_claimview GUARDED_BY(cs_main);
++
+     //! This is the top layer of the cache hierarchy - it keeps as many coins in memory as
+     //! can fit per the dbcache setting.
+     std::unique_ptr<CCoinsViewCache> m_cacheview GUARDED_BY(cs_main);
+-- 
+2.43.0
+

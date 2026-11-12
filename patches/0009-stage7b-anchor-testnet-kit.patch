@@ -1,0 +1,259 @@
+From a6bf4afe107169da137bfea4e051c383767a15e8 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <sentodaimon@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 10:32:30 +0900
+Subject: [PATCH 1/2] Coin Series: anchor difficulty at the height-1 time to
+ prevent a late-start burst
+
+The ASERT anchor's parent time becomes max(genesis time, height-1 time - 600).
+Before, a first block mined long after Bitcoin block H counted as being behind
+schedule and released easy blocks at powLimit (seen on testnet: 85 blocks in
+2.5 minutes with a 60-day-old placeholder genesis). Back-dating height 1 can at
+most restore the old behaviour bounded by the real delay.
+---
+ doc/coinseries/manual.md      |  2 +-
+ doc/coinseries/spec.md        |  3 ++-
+ src/pow.cpp                   | 14 ++++++++++----
+ src/test/coinseries_tests.cpp | 14 ++++++++++++--
+ 4 files changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/doc/coinseries/manual.md b/doc/coinseries/manual.md
+index 35d5d1d..d1dcf7d 100644
+--- a/doc/coinseries/manual.md
++++ b/doc/coinseries/manual.md
+@@ -354,7 +354,7 @@ Difficulty adjusts every block, with an added relief rule that makes it progress
+ ```
+ 
+ - Use the integer arithmetic of the published reference implementation as is (no floating point)
+-- Anchor definition: the reference specification uses the anchor block's parent time, but genesis has no parent. Proposal: the anchor block is height 1, and its parent time is the genesis time (t0 above). Then the target at height 1 is the starting target, and if blocks arrive exactly every 10 minutes the target stays at the starting target. Fix the expected values at heights 1 and 2 and at normal intervals as test vectors. τ is the half-life
++- Anchor definition: the reference specification uses the anchor block's parent time, but genesis has no parent. Decided: the anchor block is height 1, and its parent time is the later of the genesis time (t0 above) and the height-1 time minus 10 minutes, so a late start after block H does not release a burst of easy blocks. Then the target at height 1 is the starting target, and if blocks arrive exactly every 10 minutes the target stays at the starting target. Fix the expected values at heights 1 and 2 and at normal intervals as test vectors. τ is the half-life
+ - Starting target: calibrated to the owner's laptop's measured hash rate so that one block appears every 10 minutes. Example: at 2,000 hashes per second, the expected work per block is 1.2 million hashes
+ - The minimum difficulty limit is set well below the starting difficulty
+ 
+diff --git a/doc/coinseries/spec.md b/doc/coinseries/spec.md
+index f3d0edf..3f2cefd 100644
+--- a/doc/coinseries/spec.md
++++ b/doc/coinseries/spec.md
+@@ -61,7 +61,8 @@ For a new block at height h with parent p (height h−1) and genesis g:
+ 
+ - h = 1: `nBits = startBits` (anchor; no relief).
+ - h ≥ 2:
+-  - `e_asert = floor(((p.time − g.time) − T × (h − 1)) × 65536 / τ)` (C++ integer division, truncating toward zero)
++  - anchor time `a = max(g.time, b1.time − T)`, where b1 is the block at height 1 (a late start after Bitcoin block H is not "behind schedule", so it releases no burst of easy blocks; back-dating height 1 can at most restore g.time)
++  - `e_asert = floor(((p.time − a) − T × (h − 1)) × 65536 / τ)` (C++ integer division, truncating toward zero)
+   - `gap = new.time − p.time`; `e_relief = floor((gap − R) × 65536 / D)` if gap > R, else 0
+   - `e = e_asert + e_relief`
+   - `target = start × 2^(e / 65536)` evaluated with the aserti3-2d integer method: `shifts = e >> 16` (arithmetic), `frac = e & 0xffff`, `factor = 65536 + ((195766423245049·frac + 971821376·frac² + 5127·frac³ + 2^47) >> 48)`; if start has more than 224 significant bits it is first shifted right by (bits − 224) and `shifts` increased by the same; `target = (start × factor) >> 16` shifted by `shifts`; 0 becomes 1; above powLimit (or overflow) becomes powLimit.
+diff --git a/src/pow.cpp b/src/pow.cpp
+index 50a7ef7..998a069 100644
+--- a/src/pow.cpp
++++ b/src/pow.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include <pow.h>
+ 
++#include <algorithm>
++
+ #include <coinseries_pow.h>
+ 
+ #include <arith_uint256.h>
+@@ -54,11 +56,15 @@ unsigned int GetNextCoinSeriesWorkRequired(const CBlockIndex* pindexLast, const
+     start.SetCompact(params.nASERTStartBits);
+ 
+     const CBlockIndex* genesis = pindexLast->GetAncestor(0);
+-    assert(genesis);
+-    // Anchor = height 1, its parent time = genesis time. For the block at height h (= pindexLast->nHeight + 1):
+-    //   height_diff + 1 = h - 1 ideal intervals since the genesis time.
++    const CBlockIndex* first = pindexLast->GetAncestor(1);
++    assert(genesis && first);
++    // Anchor = height 1. Its "parent time" is the later of the genesis time and (height-1 time - one spacing),
++    // so a late start after Bitcoin block H (genesis time) does not count as being behind schedule and
++    // cannot release a burst of easy blocks. Back-dating height 1 can at most restore the genesis time.
++    // For the block at height h (= pindexLast->nHeight + 1): height_diff + 1 = h - 1 ideal intervals.
++    const int64_t anchor_parent_time = std::max<int64_t>(genesis->GetBlockTime(), first->GetBlockTime() - params.nPowTargetSpacing);
+     const int64_t height_diff = int64_t{pindexLast->nHeight} - 1;
+-    const int64_t time_diff = pindexLast->GetBlockTime() - genesis->GetBlockTime();
++    const int64_t time_diff = pindexLast->GetBlockTime() - anchor_parent_time;
+     int64_t exponent = ((time_diff - params.nPowTargetSpacing * (height_diff + 1)) * 65536) / params.nASERTHalfLife;
+ 
+     if (pblock) {
+diff --git a/src/test/coinseries_tests.cpp b/src/test/coinseries_tests.cpp
+index 732939e..b52c5dc 100644
+--- a/src/test/coinseries_tests.cpp
++++ b/src/test/coinseries_tests.cpp
+@@ -371,9 +371,19 @@ BOOST_AUTO_TEST_CASE(asert_vectors)
+ 
+     // One half-life behind schedule: target x2. One half-life ahead: target / 2.
+     {
++        // A late start (height 1 mined 30 days after genesis) is not "behind schedule": no burst of easy blocks.
++        TestChain l{t0, params->GenesisBlock().nBits};
++        l.Add(t0 + 30 * 86400, p.nASERTStartBits);
++        BOOST_CHECK_EQUAL(Next(l, t0 + 30 * 86400 + 600, p), p.nASERTStartBits);
++        // Back-dating height 1 can at most restore the genesis time as the anchor (same as an on-time start).
++        TestChain b{t0, params->GenesisBlock().nBits};
++        b.Add(t0 + 1, p.nASERTStartBits);
++        BOOST_CHECK_CLOSE(Ratio(Next(b, t0 + 601, p), p.nASERTStartBits), std::pow(2.0, -599.0 / 7200), 0.1);
++        // Two hours behind schedule after height 1: target x2.
+         TestChain d{t0, params->GenesisBlock().nBits};
+-        d.Add(t0 + 600 + 7200, p.nASERTStartBits);
+-        BOOST_CHECK_CLOSE(Ratio(Next(d, t0 + 600 + 7200 + 600, p), p.nASERTStartBits), 2.0, 0.1);
++        d.Add(t0 + 600, p.nASERTStartBits);
++        d.Add(t0 + 600 + 7200 + 600, p.nASERTStartBits);
++        BOOST_CHECK_CLOSE(Ratio(Next(d, t0 + 600 + 7200 + 1200, p), p.nASERTStartBits), 2.0, 0.1);
+         TestChain e{t0, params->GenesisBlock().nBits};
+         e.Add(t0 + 600, p.nASERTStartBits);
+         for (int h = 2; h <= 13; ++h) e.Add(t0 + 600, p.nASERTStartBits); // 12 blocks with no time passing = 7200s ahead
+-- 
+2.43.0
+
+From d4c557ab1517d88d5f459d21b85c24c4e2dc8577 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <sentodaimon@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 10:38:47 +0900
+Subject: [PATCH 2/2] Coin Series: Windows testnet kit (start, mine, status,
+ stop)
+
+---
+ .../windows-testnet/00-settings.bat           | 12 ++++++++++
+ .../windows-testnet/t1-start-testnet.bat      | 21 ++++++++++++++++
+ .../windows-testnet/t2-mine-testnet.bat       | 15 ++++++++++++
+ .../coinseries/windows-testnet/t3-status.bat  | 14 +++++++++++
+ .../windows-testnet/t4-stop-testnet.bat       |  6 +++++
+ .../\354\202\254\354\232\251\353\262\225.txt" | 24 +++++++++++++++++++
+ 6 files changed, 92 insertions(+)
+ create mode 100644 contrib/coinseries/windows-testnet/00-settings.bat
+ create mode 100644 contrib/coinseries/windows-testnet/t1-start-testnet.bat
+ create mode 100644 contrib/coinseries/windows-testnet/t2-mine-testnet.bat
+ create mode 100644 contrib/coinseries/windows-testnet/t3-status.bat
+ create mode 100644 contrib/coinseries/windows-testnet/t4-stop-testnet.bat
+ create mode 100644 "contrib/coinseries/windows-testnet/\354\202\254\354\232\251\353\262\225.txt"
+
+diff --git a/contrib/coinseries/windows-testnet/00-settings.bat b/contrib/coinseries/windows-testnet/00-settings.bat
+new file mode 100644
+index 0000000..27927eb
+--- /dev/null
++++ b/contrib/coinseries/windows-testnet/00-settings.bat
+@@ -0,0 +1,12 @@
++@echo off
++rem ===== Coin Series testnet settings (edit only this file) =====
++rem Data folder: blocks, wallets and the snapshot live here (use a drive with 30 GB free)
++set DATA=D:\CoinSeriesData
++rem 80-byte header (160 hex characters) of the announced Bitcoin block H. Filled in on launch day.
++set BEACON=
++rem Address of another testnet node to connect to (example 1.2.3.4). Leave empty for the first node.
++set SEED=
++rem Mining threads (this PC has 4; use 2 if it gets too hot or slow)
++set THREADS=4
++rem Development only: start without the snapshot. Normally leave empty.
++set EXTRA=
+diff --git a/contrib/coinseries/windows-testnet/t1-start-testnet.bat b/contrib/coinseries/windows-testnet/t1-start-testnet.bat
+new file mode 100644
+index 0000000..53c42e3
+--- /dev/null
++++ b/contrib/coinseries/windows-testnet/t1-start-testnet.bat
+@@ -0,0 +1,21 @@
++@echo off
++cd /d "%~dp0"
++call 00-settings.bat
++if not exist "%DATA%" mkdir "%DATA%"
++if not exist "%DATA%\snapshot\utxo-840000.dat" if "%EXTRA%"=="" (
++  echo The snapshot is missing: put utxo-840000.dat in %DATA%\snapshot\ and run again.
++  pause
++  exit /b 1
++)
++set OPT=-datadir="%DATA%" -chain=test
++if not "%BEACON%"=="" set OPT=%OPT% -beaconheader=%BEACON%
++if not "%SEED%"=="" set OPT=%OPT% -addnode=%SEED%
++echo Starting the five testnet nodes. Do not click inside the node windows (that pauses them).
++for %%c in (half quarter dime nickel cent) do start "testnet %%c" /min bitcoind.exe %OPT% -coin=%%c %EXTRA%
++echo Waiting for the nodes (the first start checks the snapshot and can take a long time)...
++for %%c in (half quarter dime nickel cent) do (
++  bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c -rpcwait -rpcwaittimeout=7200 createwallet w >nul 2>&1
++  bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c loadwallet w >nul 2>&1
++)
++echo All five testnet nodes are running. Next: t2-mine-testnet.bat
++pause
+diff --git a/contrib/coinseries/windows-testnet/t2-mine-testnet.bat b/contrib/coinseries/windows-testnet/t2-mine-testnet.bat
+new file mode 100644
+index 0000000..a048ff4
+--- /dev/null
++++ b/contrib/coinseries/windows-testnet/t2-mine-testnet.bat
+@@ -0,0 +1,15 @@
++@echo off
++cd /d "%~dp0"
++call 00-settings.bat
++for %%c in (half quarter dime nickel cent) do (
++  if not exist "%DATA%\address-%%c.txt" bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c getnewaddress > "%DATA%\address-%%c.txt"
++)
++set /p A_HALF=<"%DATA%\address-half.txt"
++set /p A_QUARTER=<"%DATA%\address-quarter.txt"
++set /p A_DIME=<"%DATA%\address-dime.txt"
++set /p A_NICKEL=<"%DATA%\address-nickel.txt"
++set /p A_CENT=<"%DATA%\address-cent.txt"
++echo Mining all five testnet chains with %THREADS% threads. Close this window to stop mining.
++echo Log: %DATA%\mining-log.txt
++cs-miner.exe --chain test --datadir "%DATA%" --threads %THREADS% --coin half=%A_HALF% --coin quarter=%A_QUARTER% --coin dime=%A_DIME% --coin nickel=%A_NICKEL% --coin cent=%A_CENT% >> "%DATA%\mining-log.txt" 2>&1
++pause
+diff --git a/contrib/coinseries/windows-testnet/t3-status.bat b/contrib/coinseries/windows-testnet/t3-status.bat
+new file mode 100644
+index 0000000..5da68c4
+--- /dev/null
++++ b/contrib/coinseries/windows-testnet/t3-status.bat
+@@ -0,0 +1,14 @@
++@echo off
++cd /d "%~dp0"
++call 00-settings.bat
++set OUT=%DATA%\status.txt
++echo Coin Series testnet status %DATE% %TIME% > "%OUT%"
++for %%c in (half quarter dime nickel cent) do (
++  echo ==== %%c >> "%OUT%"
++  bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c getmininginfo >> "%OUT%" 2>&1
++  bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c getconnectioncount >> "%OUT%" 2>&1
++  bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c getbalance >> "%OUT%" 2>&1
++)
++type "%OUT%"
++echo Saved to %OUT%
++pause
+diff --git a/contrib/coinseries/windows-testnet/t4-stop-testnet.bat b/contrib/coinseries/windows-testnet/t4-stop-testnet.bat
+new file mode 100644
+index 0000000..1f682c8
+--- /dev/null
++++ b/contrib/coinseries/windows-testnet/t4-stop-testnet.bat
+@@ -0,0 +1,6 @@
++@echo off
++cd /d "%~dp0"
++call 00-settings.bat
++for %%c in (half quarter dime nickel cent) do bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c stop
++echo Stopped. Mining stops by itself when the nodes stop (or close its window).
++pause
+diff --git "a/contrib/coinseries/windows-testnet/\354\202\254\354\232\251\353\262\225.txt" "b/contrib/coinseries/windows-testnet/\354\202\254\354\232\251\353\262\225.txt"
+new file mode 100644
+index 0000000..9a14afe
+--- /dev/null
++++ "b/contrib/coinseries/windows-testnet/\354\202\254\354\232\251\353\262\225.txt"
+@@ -0,0 +1,24 @@
++﻿Coin Series 시험망 실행 묶음 (7일 공개 시험용)
++
++※ 개인 PC·집 인터넷에서만 실행 (회사 PC·회사망 금지)
++※ 시험망 코인은 가치 없음. 시험 후 폐기
++
++준비 (한 번만)
++1. 00-settings.bat 을 메모장으로 열어 값 입력
++   - DATA     : 데이터 폴더 (기본 D:\CoinSeriesData, 여유 30GB 이상)
++   - BEACON   : 비트코인 블록 H의 머리 값 (출시일에 공지되는 160자리 값)
++   - SEED     : 연결할 다른 시험망 노드 주소 (첫 노드는 비워 둠)
++   - THREADS  : 채굴 스레드 수 (이 PC 4, 뜨겁거나 느리면 2)
++2. 스냅샷 파일 utxo-840000.dat 를 DATA 폴더 안 snapshot 폴더에 넣기
++
++실행 순서
++t1-start-testnet.bat  노드 5종 시작 (첫 실행 때 스냅샷 검사로 오래 걸림)
++t2-mine-testnet.bat   5종 동시 채굴 (창을 닫으면 채굴 중지)
++t3-status.bat         현황 저장 -> DATA\status.txt 를 Claude에게 보내기
++t4-stop-testnet.bat   노드 종료
++
++주의
++- 블록 H가 나오면 바로 t1 -> t2 실행 (출발이 늦어도 쉬운 블록이 쏟아지지는 않도록 규칙 보완됨)
++- 검은 창 안을 마우스로 클릭하지 말 것: 제목에 "선택"이 붙고 멈춤 -> Esc
++- 방화벽 허용 창: 외부 채굴자와 연결하려면 "허용" 필요
++- 채굴 보상은 100블록 뒤부터 사용 가능 (잔액 0으로 보여도 정상)
+-- 
+2.43.0
+

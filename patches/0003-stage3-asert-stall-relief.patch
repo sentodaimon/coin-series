@@ -1,0 +1,470 @@
+From 6c88aaf7e78f3a5de3186138f65a59468efdfb11 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <339524263+sentodaimon@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 15:04:18 +0900
+Subject: [PATCH] Coin Series stage 3: per-block difficulty (ASERT anchored at
+ height 1) with stall relief
+
+- aserti3-2d integer evaluation, anchor = height 1 with parent time = genesis time,
+  half-life 2 hours; pre-shift for RandomX-sized targets (> 2^224)
+- stall relief: block more than 1 hour after its parent gets target x 2^((gap-3600)/1800),
+  combined with the ASERT exponent; not applied at height 1; capped at powLimit
+- per-chain future time limit (Coin Series: 10 minutes)
+- placeholder start target for 1,000 H/s (600,000 hashes per block), limit = start x 4096
+- miner updates difficulty when it updates the time; header sync accepts per-block changes
+- regtest: -coinseriesasert enables the real rules (default fixed easiest difficulty)
+- tests: anchor/height-2 vectors, half-life x2 / /2, relief x2 / x1024, 10-minute shift = 1.26x,
+  limit cap, integer accuracy, 1000x inflow/exit simulation with the real function
+---
+ src/chainparams.cpp           |   1 +
+ src/chainparamsbase.cpp       |   1 +
+ src/consensus/params.h        |  13 +++
+ src/kernel/chainparams.cpp    |  31 +++++--
+ src/kernel/chainparams.h      |   2 +
+ src/node/miner.cpp            |   4 +-
+ src/pow.cpp                   |  60 +++++++++++++
+ src/pow.h                     |  12 +++
+ src/rpc/mining.cpp            |   2 +-
+ src/test/coinseries_tests.cpp | 163 ++++++++++++++++++++++++++++++++++
+ src/validation.cpp            |   2 +-
+ 11 files changed, 278 insertions(+), 13 deletions(-)
+
+diff --git a/src/chainparams.cpp b/src/chainparams.cpp
+index f89a5b7..8183722 100644
+--- a/src/chainparams.cpp
++++ b/src/chainparams.cpp
+@@ -46,6 +46,7 @@ void ReadSigNetArgs(const ArgsManager& args, CChainParams::SigNetOptions& option
+ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& options)
+ {
+     if (auto value = args.GetBoolArg("-fastprune")) options.fastprune = *value;
++    if (auto value = args.GetBoolArg("-coinseriesasert")) options.coin_series_asert = *value;
+     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;
+ 
+     for (const std::string& arg : args.GetArgs("-testactivationheight")) {
+diff --git a/src/chainparamsbase.cpp b/src/chainparamsbase.cpp
+index 21205a2..51147a6 100644
+--- a/src/chainparamsbase.cpp
++++ b/src/chainparamsbase.cpp
+@@ -15,6 +15,7 @@
+ 
+ void SetupChainParamsBaseOptions(ArgsManager& argsman)
+ {
++    argsman.AddArg("-coinseriesasert", "Coin Series regtest: use the real difficulty rules (ASERT + stall relief) instead of fixed easiest difficulty (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+     argsman.AddArg("-randomxversion=<n>", "Coin Series development: RandomX version for proof of work, 1 or 2 (default: 1). All nodes of a network must use the same value.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-coin=<coin>", "Coin Series: run the chain of <coin>. Allowed values: " LIST_COIN_NAMES ". Combine with -chain=main, test or regtest. Without -coin the software runs original Bitcoin (for regression testing only).", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-chain=<chain>", "Use the chain <chain> (default: main). Allowed values: " LIST_CHAIN_NAMES, ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+diff --git a/src/consensus/params.h b/src/consensus/params.h
+index bfab372..ebfdc92 100644
+--- a/src/consensus/params.h
++++ b/src/consensus/params.h
+@@ -94,6 +94,19 @@ struct Params {
+     uint32_t nChainSigId{0};
+     /** Coin Series: RandomX version used for proof of work (1 or 2). Undecided; selectable for testing. */
+     int nRandomXVersion{1};
++    /**
++     * Coin Series difficulty: per-block exponential adjustment (aserti3-2d) anchored at height 1,
++     * whose parent time is the genesis time. 0 = not used (original Bitcoin rules).
++     */
++    int64_t nASERTHalfLife{0};
++    /** Coin Series: compact target of height 1 (the anchor), calibrated to the launch laptop. */
++    uint32_t nASERTStartBits{0};
++    /** Coin Series stall relief: if a block's time is more than nStallReliefAfter seconds after its parent,
++     *  its target is multiplied by 2^((gap - nStallReliefAfter) / nStallReliefDoubling). Not applied at height 1. */
++    int64_t nStallReliefAfter{3600};
++    int64_t nStallReliefDoubling{1800};
++    /** Maximum seconds a block time may be ahead of the node's clock (Bitcoin: 2 hours). */
++    int64_t nMaxFutureBlockTime{2 * 60 * 60};
+     /**
+      * Hashes of blocks that
+      * - are known to be consensus valid, and
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index da7f544..2ae7d68 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -745,19 +745,32 @@ public:
+         consensus.MinBIP9WarningHeight = 0;
+ 
+         consensus.nPowTargetSpacing = 10 * 60;
++        consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // unused by ASERT; kept for Bitcoin code paths
++        consensus.fPowAllowMinDifficultyBlocks = false;
++        consensus.enforce_BIP94 = false; // ASERT is anchored to the genesis time; timewarp rule not needed
++        // Difficulty (decided: per-block adjustment + stall relief; parameters proposed):
++        //   half-life 2 hours, relief after 1 hour of no block, doubling every 30 minutes, future limit 10 minutes.
++        consensus.nStallReliefAfter = 60 * 60;
++        consensus.nStallReliefDoubling = 30 * 60;
++        consensus.nMaxFutureBlockTime = 10 * 60;
+         if (env == CoinEnv::REGTEST) {
+             consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+-            consensus.nPowTargetTimespan = 24 * 60 * 60;
+-            consensus.fPowAllowMinDifficultyBlocks = true;
+-            consensus.fPowNoRetargeting = true;
+-            consensus.enforce_BIP94 = opts.enforce_bip94;
++            if (opts.coin_series_asert) {
++                consensus.nASERTHalfLife = 2 * 60 * 60;
++                consensus.nASERTStartBits = 0x201fffff; // ~8 hashes per block, for fast tests
++                consensus.fPowNoRetargeting = false;
++            } else {
++                consensus.nASERTHalfLife = 0; // fixed easiest difficulty for quick regression tests
++                consensus.fPowNoRetargeting = true;
++                consensus.nMaxFutureBlockTime = 2 * 60 * 60;
++            }
+         } else {
+-            // Placeholder until the ASERT stage sets the real starting target and limit (RandomX: ~4096 hashes at the limit).
+-            consensus.powLimit = uint256{"000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+-            consensus.nPowTargetTimespan = 14 * 24 * 60 * 60;
+-            consensus.fPowAllowMinDifficultyBlocks = (env == CoinEnv::TEST);
++            // Starting target: PLACEHOLDER assuming 1,000 RandomX hashes per second (600,000 hashes per block).
++            // Replaced by the launch laptop's measured hash rate. Limit = start x 4096 (~146 hashes per block).
++            consensus.powLimit = uint256{"01bf640000000000000000000000000000000000000000000000000000000000"};
++            consensus.nASERTHalfLife = 2 * 60 * 60;
++            consensus.nASERTStartBits = 0x1e1bf647;
+             consensus.fPowNoRetargeting = false;
+-            consensus.enforce_BIP94 = (env == CoinEnv::TEST);
+         }
+ 
+         const int32_t period = env == CoinEnv::REGTEST ? 144 : 2016;
+diff --git a/src/kernel/chainparams.h b/src/kernel/chainparams.h
+index 1b4e38e..881fbd7 100644
+--- a/src/kernel/chainparams.h
++++ b/src/kernel/chainparams.h
+@@ -153,6 +153,8 @@ public:
+         std::unordered_map<Consensus::BuriedDeployment, int> activation_heights{};
+         bool fastprune{false};
+         bool enforce_bip94{false};
++        //! Coin Series regtest: use the real difficulty rules (ASERT + stall relief) instead of fixed difficulty.
++        bool coin_series_asert{false};
+     };
+ 
+     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);
+diff --git a/src/node/miner.cpp b/src/node/miner.cpp
+index 7ea8d10..3b6350d 100644
+--- a/src/node/miner.cpp
++++ b/src/node/miner.cpp
+@@ -56,8 +56,8 @@ int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParam
+         pblock->nTime = nNewTime;
+     }
+ 
+-    // Updating time can change work required on testnet:
+-    if (consensusParams.fPowAllowMinDifficultyBlocks) {
++    // Updating time can change work required on testnet, and on Coin Series chains (stall relief):
++    if (consensusParams.fPowAllowMinDifficultyBlocks || consensusParams.nASERTHalfLife > 0) {
+         pblock->nBits = GetNextWorkRequired(pindexPrev, pblock, consensusParams);
+     }
+ 
+diff --git a/src/pow.cpp b/src/pow.cpp
+index e5f4ff8..50a7ef7 100644
+--- a/src/pow.cpp
++++ b/src/pow.cpp
+@@ -13,9 +13,67 @@
+ #include <uint256.h>
+ #include <util/check.h>
+ 
++arith_uint256 CoinSeriesApplyExponent(const arith_uint256& ref_in, int64_t exponent, const arith_uint256& pow_limit)
++{
++    // aserti3-2d (Bitcoin Cash, 2020) evaluation. The reference implementation requires targets below 2^224
++    // so that ref x factor (factor < 2^17) cannot overflow. RandomX targets are larger, so pre-shift the
++    // reference down and add the shift back (the dropped low bits are far below target precision).
++    arith_uint256 ref = ref_in;
++    int64_t shifts = exponent >> 16; // arithmetic shift: floor division by 65536
++    const auto frac = static_cast<uint16_t>(exponent);
++    if (const unsigned int bits = ref.bits(); bits > 224) {
++        ref >>= (bits - 224);
++        shifts += bits - 224;
++    }
++    // Cubic approximation of 2^(frac/65536) - 1, scaled by 2^16 (exactly as in aserti3-2d).
++    const uint32_t factor = 65536 + ((195766423245049ull * frac +
++                                      971821376ull * frac * frac +
++                                      5127ull * frac * frac * frac +
++                                      (1ull << 47)) >> 48);
++    arith_uint256 next = ref * factor;
++    shifts -= 16;
++    if (shifts <= 0) {
++        next = shifts <= -256 ? arith_uint256{0} : (next >> static_cast<unsigned int>(-shifts));
++    } else {
++        if (shifts >= 256 || next.bits() + shifts > 256) return pow_limit; // overflow
++        next <<= static_cast<unsigned int>(shifts);
++    }
++    if (next == 0) return arith_uint256{1};
++    if (next > pow_limit) return pow_limit;
++    return next;
++}
++
++unsigned int GetNextCoinSeriesWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader* pblock, const Consensus::Params& params)
++{
++    assert(pindexLast != nullptr);
++    // Height 1 is the anchor: it uses the start target; no stall relief (genesis time may differ from real time).
++    if (pindexLast->nHeight == 0) return params.nASERTStartBits;
++
++    const arith_uint256 pow_limit = UintToArith256(params.powLimit);
++    arith_uint256 start;
++    start.SetCompact(params.nASERTStartBits);
++
++    const CBlockIndex* genesis = pindexLast->GetAncestor(0);
++    assert(genesis);
++    // Anchor = height 1, its parent time = genesis time. For the block at height h (= pindexLast->nHeight + 1):
++    //   height_diff + 1 = h - 1 ideal intervals since the genesis time.
++    const int64_t height_diff = int64_t{pindexLast->nHeight} - 1;
++    const int64_t time_diff = pindexLast->GetBlockTime() - genesis->GetBlockTime();
++    int64_t exponent = ((time_diff - params.nPowTargetSpacing * (height_diff + 1)) * 65536) / params.nASERTHalfLife;
++
++    if (pblock) {
++        const int64_t gap = pblock->GetBlockTime() - pindexLast->GetBlockTime();
++        if (gap > params.nStallReliefAfter) {
++            exponent += ((gap - params.nStallReliefAfter) * 65536) / params.nStallReliefDoubling;
++        }
++    }
++    return CoinSeriesApplyExponent(start, exponent, pow_limit).GetCompact();
++}
++
+ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params& params)
+ {
+     assert(pindexLast != nullptr);
++    if (params.nASERTHalfLife > 0) return GetNextCoinSeriesWorkRequired(pindexLast, pblock, params);
+     unsigned int nProofOfWorkLimit = UintToArith256(params.powLimit).GetCompact();
+ 
+     // Only change once per difficulty adjustment interval
+@@ -90,6 +148,8 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
+ // or decrease beyond the permitted limits.
+ bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t height, uint32_t old_nbits, uint32_t new_nbits)
+ {
++    // Coin Series: difficulty changes every block (ASERT + stall relief); the exact value is checked in validation.
++    if (params.nASERTHalfLife > 0) return true;
+     if (params.fPowAllowMinDifficultyBlocks) return true;
+ 
+     if (height % params.DifficultyAdjustmentInterval() == 0) {
+diff --git a/src/pow.h b/src/pow.h
+index 3c5e6ee..6c792ef 100644
+--- a/src/pow.h
++++ b/src/pow.h
+@@ -45,6 +45,18 @@ bool CheckProofOfWork(const CBlockHeader& header, const Consensus::Params&);
+  */
+ bool CheckStoredProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params&);
+ 
++/**
++ * Coin Series: target of the next block. Height 1 uses nASERTStartBits; later heights use
++ *   target = start x 2^((t_prev - t_genesis - spacing x (h - 1)) / halflife)     (aserti3-2d, anchor at height 1)
++ * and, if the new block's time is more than nStallReliefAfter after its parent,
++ *   x 2^((gap - nStallReliefAfter) / nStallReliefDoubling)                         (stall relief)
++ * Both exponents are combined in 1/65536 units and evaluated with aserti3-2d's integer approximation,
++ * capped at powLimit. pblock may be null (no relief).
++ */
++unsigned int GetNextCoinSeriesWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader* pblock, const Consensus::Params&);
++/** aserti3-2d integer evaluation of ref x 2^(exponent / 65536), clamped to [1, pow_limit]. */
++arith_uint256 CoinSeriesApplyExponent(const arith_uint256& ref, int64_t exponent, const arith_uint256& pow_limit);
++
+ /**
+  * Return false if the proof-of-work requirement specified by new_nbits at a
+  * given height is not possible, given the proof-of-work on the prior block as
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index 6b1605d..61623e4 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -1224,7 +1224,7 @@ static RPCHelpMan getmergework()
+         if (!request.params[1].isNull()) {
+             const int64_t t = request.params[1].getInt<int64_t>();
+             if (t <= prev->GetMedianTimePast()) throw JSONRPCError(RPC_INVALID_PARAMETER, "time must be later than the median time of the last 11 blocks");
+-            if (t > GetTime() + MAX_FUTURE_BLOCK_TIME) throw JSONRPCError(RPC_INVALID_PARAMETER, "time is too far in the future");
++            if (t > GetTime() + consensus.nMaxFutureBlockTime) throw JSONRPCError(RPC_INVALID_PARAMETER, "time is too far in the future");
+             block->nTime = static_cast<uint32_t>(t);
+             // The required target can depend on the header time (difficulty rules).
+             block->nBits = GetNextWorkRequired(prev, block.get(), consensus);
+diff --git a/src/test/coinseries_tests.cpp b/src/test/coinseries_tests.cpp
+index a8d20a0..23ef2a1 100644
+--- a/src/test/coinseries_tests.cpp
++++ b/src/test/coinseries_tests.cpp
+@@ -18,12 +18,17 @@
+ #include <streams.h>
+ #include <script/script.h>
+ #include <util/chaintype.h>
++#include <chain.h>
++#include <random.h>
+ #include <validation.h>
+ 
+ #include <test/util/setup_common.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
++#include <algorithm>
++#include <cmath>
++#include <deque>
+ #include <set>
+ #include <string>
+ 
+@@ -291,4 +296,162 @@ BOOST_AUTO_TEST_CASE(randomx_proof_of_work)
+     BOOST_CHECK(CoinSeriesRandomXHash(1, key, uint256::ONE, 0) != CoinSeriesRandomXHash(2, key, uint256::ONE, 0));
+ }
+ 
++// ---- Difficulty: ASERT anchored at height 1 + stall relief ----
++namespace {
++struct TestChain {
++    std::deque<CBlockIndex> blocks;
++    std::deque<uint256> hashes;
++    explicit TestChain(uint32_t genesis_time, uint32_t genesis_bits)
++    {
++        Add(genesis_time, genesis_bits);
++    }
++    const CBlockIndex* Add(uint32_t time, uint32_t bits)
++    {
++        CBlockIndex& b = blocks.emplace_back();
++        hashes.emplace_back(uint256{static_cast<uint8_t>(blocks.size())});
++        b.phashBlock = &hashes.back();
++        b.nTime = time;
++        b.nBits = bits;
++        b.nHeight = blocks.size() - 1;
++        b.pprev = blocks.size() > 1 ? &blocks[blocks.size() - 2] : nullptr;
++        b.BuildSkip();
++        return &b;
++    }
++    const CBlockIndex* Tip() const { return &blocks.back(); }
++};
++double Ratio(uint32_t bits, uint32_t start_bits)
++{
++    arith_uint256 a, b;
++    a.SetCompact(bits);
++    b.SetCompact(start_bits);
++    return a.getdouble() / b.getdouble();
++}
++uint32_t Next(const TestChain& c, uint32_t new_time, const Consensus::Params& p)
++{
++    CBlockHeader h;
++    h.nTime = new_time;
++    return GetNextWorkRequired(c.Tip(), &h, p);
++}
++} // namespace
++
++BOOST_AUTO_TEST_CASE(asert_vectors)
++{
++    auto params = Make(CoinSeriesId::DIME, ChainType::MAIN);
++    const auto& p = params->GetConsensus();
++    BOOST_REQUIRE_EQUAL(p.nASERTHalfLife, 7200);
++    const uint32_t t0 = params->GenesisBlock().nTime;
++    TestChain c{t0, params->GenesisBlock().nBits};
++
++    // Height 1 (anchor) uses the start target, even long after genesis (no relief at height 1).
++    BOOST_CHECK_EQUAL(Next(c, t0 + 600, p), p.nASERTStartBits);
++    BOOST_CHECK_EQUAL(Next(c, t0 + 30 * 86400, p), p.nASERTStartBits);
++    c.Add(t0 + 600, p.nASERTStartBits);
++
++    // Height 2 when height 1 came exactly on schedule: start target exactly (fixes the earlier 0.9976 off-by-one).
++    BOOST_CHECK_EQUAL(Next(c, t0 + 1200, p), p.nASERTStartBits);
++
++    // Steady 10-minute blocks keep the start target.
++    for (int h = 2; h <= 500; ++h) {
++        const uint32_t bits = Next(c, t0 + 600 * h, p);
++        BOOST_CHECK_EQUAL(bits, p.nASERTStartBits);
++        c.Add(t0 + 600 * h, bits);
++    }
++
++    // One half-life behind schedule: target x2. One half-life ahead: target / 2.
++    {
++        TestChain d{t0, params->GenesisBlock().nBits};
++        d.Add(t0 + 600 + 7200, p.nASERTStartBits);
++        BOOST_CHECK_CLOSE(Ratio(Next(d, t0 + 600 + 7200 + 600, p), p.nASERTStartBits), 2.0, 0.1);
++        TestChain e{t0, params->GenesisBlock().nBits};
++        e.Add(t0 + 600, p.nASERTStartBits);
++        for (int h = 2; h <= 13; ++h) e.Add(t0 + 600, p.nASERTStartBits); // 12 blocks with no time passing = 7200s ahead
++        BOOST_CHECK_CLOSE(Ratio(Next(e, t0 + 601, p), p.nASERTStartBits), 0.5, 0.1);
++    }
++
++    // Stall relief: none up to 1 hour, x2 at 1.5 hours, x1024 at 6 hours (5 hours of excess / 30 minutes).
++    const uint32_t tip_time = c.Tip()->nTime;
++    const uint32_t base = Next(c, tip_time + 600, p);
++    BOOST_CHECK_EQUAL(Next(c, tip_time + 3600, p), base);
++    BOOST_CHECK_CLOSE(Ratio(Next(c, tip_time + 5400, p), base), 2.0, 0.1);
++    BOOST_CHECK_CLOSE(Ratio(Next(c, tip_time + 6 * 3600, p), base), 1024.0, 0.1);
++    // Moving the time 10 minutes forward inside the relief zone eases the target about 1.26x (bounded by the future limit).
++    BOOST_CHECK_CLOSE(Ratio(Next(c, tip_time + 7200 + 600, p), Next(c, tip_time + 7200, p)), std::pow(2.0, 600.0 / 1800), 0.1);
++    BOOST_CHECK_EQUAL(p.nMaxFutureBlockTime, 600);
++    // Never easier than the limit.
++    arith_uint256 lim = UintToArith256(p.powLimit);
++    arith_uint256 got;
++    got.SetCompact(Next(c, tip_time + 30 * 86400, p));
++    BOOST_CHECK(got <= lim);
++    BOOST_CHECK_EQUAL(Next(c, tip_time + 30 * 86400, p), lim.GetCompact());
++
++    // Original Bitcoin rules are untouched.
++    auto btc = CreateChainParams(ArgsManager{}, ChainType::MAIN);
++    BOOST_CHECK_EQUAL(btc->GetConsensus().nASERTHalfLife, 0);
++}
++
++// The integer evaluation matches 2^x closely across the range (aserti3-2d approximation error < 0.013%).
++BOOST_AUTO_TEST_CASE(asert_exponent_accuracy)
++{
++    const arith_uint256 ref = UintToArith256(uint256{"00001bf647000000000000000000000000000000000000000000000000000000"});
++    const arith_uint256 lim = ~arith_uint256{0} >> 1;
++    for (int64_t e = -20 * 65536; e <= 15 * 65536; e += 4099) { // stays below the clamp limit
++        const double expected = ref.getdouble() * std::pow(2.0, double(e) / 65536.0);
++        const double got = CoinSeriesApplyExponent(ref, e, lim).getdouble();
++        BOOST_CHECK_CLOSE(got, expected, 0.02);
++    }
++}
++
++// Simulation with the real difficulty function: 1000x hash power for 48 hours, then it leaves.
++// Reports and checks the time to the first block after the exit (decided goal: within about 6 hours).
++BOOST_AUTO_TEST_CASE(asert_stall_simulation)
++{
++    auto params = Make(CoinSeriesId::HALF, ChainType::MAIN);
++    const auto& p = params->GetConsensus();
++    arith_uint256 start;
++    start.SetCompact(p.nASERTStartBits);
++    const double base_rate = (std::pow(2.0, 256) / start.getdouble()) / 600.0; // hashes/s giving 10-minute blocks
++    FastRandomContext rng{uint256{42}};
++
++    std::vector<double> first_after_exit, recover, inflow_blocks;
++    for (int run = 0; run < 30; ++run) {
++        const uint32_t t0 = params->GenesisBlock().nTime;
++        TestChain c{t0, params->GenesisBlock().nBits};
++        uint32_t now = t0;
++        const uint32_t inflow_start = t0 + 2 * 86400, inflow_end = inflow_start + 48 * 3600;
++        int blocks_in_inflow = 0;
++        uint32_t first_exit_block = 0, recovered_at = 0;
++        std::deque<uint32_t> recent;
++        while (now < inflow_end + 20 * 86400) {
++            now += 30; // 30-second steps
++            const double rate = base_rate * ((now >= inflow_start && now < inflow_end) ? 1000.0 : 1.0);
++            const uint32_t bits = Next(c, now, p);
++            arith_uint256 tgt;
++            tgt.SetCompact(bits);
++            const double work = std::pow(2.0, 256) / tgt.getdouble();
++            const double prob = 1.0 - std::exp(-rate * 30.0 / work);
++            if (rng.randrange(1u << 30) < prob * double(1u << 30)) {
++                c.Add(now, bits);
++                if (now >= inflow_start && now < inflow_end) ++blocks_in_inflow;
++                if (now >= inflow_end) {
++                    if (!first_exit_block) first_exit_block = now;
++                    recent.push_back(now);
++                    if (recent.size() > 6) recent.pop_front();
++                    if (!recovered_at && recent.size() == 6 && (recent.back() - recent.front()) / 5.0 <= 900.0) recovered_at = now;
++                }
++            }
++            if (recovered_at) break;
++        }
++        first_after_exit.push_back((first_exit_block - inflow_end) / 3600.0);
++        recover.push_back(((recovered_at ? recovered_at : now) - inflow_end) / 3600.0);
++        inflow_blocks.push_back(blocks_in_inflow);
++    }
++    auto median = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
++    auto pct = [](std::vector<double> v, double q) { std::sort(v.begin(), v.end()); return v[std::min<size_t>(v.size() - 1, size_t(q * v.size()))]; };
++    BOOST_TEST_MESSAGE("1000x for 48h then exit (30 runs): first block after exit median " << median(first_after_exit)
++        << "h, 90th pct " << pct(first_after_exit, 0.9) << "h; back to <=15 min average (6 blocks) median "
++        << median(recover) << "h; blocks during inflow median " << median(inflow_blocks) << " (normal 288)");
++    BOOST_CHECK(median(first_after_exit) <= 6.5);
++    BOOST_CHECK(median(recover) <= 48.0);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validation.cpp b/src/validation.cpp
+index ca987ca..54ee12a 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -4159,7 +4159,7 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
+     }
+ 
+     // Check timestamp
+-    if (block.Time() > NodeClock::now() + std::chrono::seconds{MAX_FUTURE_BLOCK_TIME}) {
++    if (block.Time() > NodeClock::now() + std::chrono::seconds{consensusParams.nMaxFutureBlockTime}) {
+         return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
+     }
+ 
+-- 
+2.43.0
+

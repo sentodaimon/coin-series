@@ -1,0 +1,1498 @@
+From 2168817aa1d55e66e7d7047a3e845855508d5b85 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <339524263+sentodaimon@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:18:51 +0900
+Subject: [PATCH] Coin Series stage 2: RandomX proof of work with five-chain
+ merged mining
+
+- vendored RandomX (src/randomx, BSD 3-Clause), linked into bitcoin_common
+- Coin Series header: 76-byte body + 3 merge-tree siblings + 64-bit nonce (180 bytes);
+  Bitcoin 80-byte format unchanged when no -coin is selected
+- PoW: commitment = SHA256d(tag || body), 8-leaf merge tree (slot per chain),
+  key = SHA256(tag || nTime/1209600), RandomX(key, root || nonce64) <= target
+- RandomX version 1 or 2 selectable (-randomxversion, development only)
+- block index / disk index / headers sync carry the new fields
+- RPC: getmergework, submitmergework; getblockheader shows nonce64 and mergebranch
+- contrib/coinseries/merge_miner.py reference merged miner (RandomX via shared library)
+- tests: header format, merge tree, key epochs, PoW accept/reject (v1, v2),
+  merged-mining smoke test (restart reload, P2P sync)
+---
+ contrib/coinseries/merge_miner.py | 212 ++++++++++++++++++++++++++++++
+ contrib/coinseries/merge_smoke.sh |  60 +++++++++
+ src/CMakeLists.txt                |   6 +
+ src/chain.h                       |  18 ++-
+ src/chainparams.cpp               |   5 +-
+ src/chainparamsbase.cpp           |   1 +
+ src/coinseries_pow.cpp            | 148 +++++++++++++++++++++
+ src/coinseries_pow.h              |  47 +++++++
+ src/consensus/params.h            |   2 +
+ src/headerssync.cpp               |   4 +-
+ src/headerssync.h                 |   8 +-
+ src/kernel/CMakeLists.txt         |   2 +
+ src/kernel/chainparams.cpp        |  36 ++---
+ src/kernel/chainparams.h          |   2 +-
+ src/node/blockstorage.cpp         |   6 +-
+ src/pow.cpp                       |  17 +++
+ src/pow.h                         |  12 ++
+ src/primitives/block.cpp          |  12 ++
+ src/primitives/block.h            |  39 +++++-
+ src/rpc/blockchain.cpp            |  11 ++
+ src/rpc/client.cpp                |   2 +
+ src/rpc/mining.cpp                | 175 ++++++++++++++++++++++++
+ src/test/coinseries_tests.cpp     | 105 ++++++++++++++-
+ src/validation.cpp                |   4 +-
+ 24 files changed, 904 insertions(+), 30 deletions(-)
+ create mode 100644 contrib/coinseries/merge_miner.py
+ create mode 100755 contrib/coinseries/merge_smoke.sh
+ create mode 100644 src/coinseries_pow.cpp
+ create mode 100644 src/coinseries_pow.h
+
+diff --git a/contrib/coinseries/merge_miner.py b/contrib/coinseries/merge_miner.py
+new file mode 100644
+index 0000000..9ff8469
+--- /dev/null
++++ b/contrib/coinseries/merge_miner.py
+@@ -0,0 +1,212 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 Sento Daimon
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""
++Coin Series merged miner (reference implementation).
++
++One RandomX computation mines all five chains at once:
++  1. ask each node for work with the same header time (getmergework)
++  2. build the 8-leaf merge tree from the commitments (slot = chain's merge slot)
++  3. RandomX(key, root || nonce64) for increasing nonces
++  4. for every chain whose target is met, submit that chain's 3 sibling hashes and the nonce
++
++Requires the RandomX shared library (librandomx.so / randomx.dll) built from src/randomx.
++
++Example:
++  merge_miner.py --lib build-randomx/librandomx.so --datadir ~/.bitcoin --chain regtest \
++      --coin half=ADDR --coin quarter=ADDR --coin dime=ADDR --coin nickel=ADDR --coin cent=ADDR
++"""
++import argparse
++import base64
++import ctypes
++import hashlib
++import json
++import os
++import struct
++import sys
++import time
++import urllib.request
++
++COINS = {  # name: (merge slot, main RPC port)
++    "half": (0, 38202), "quarter": (1, 38204), "dime": (2, 38210), "nickel": (3, 38220), "cent": (4, 38300),
++}
++ENV_OFFSET = {"main": 0, "test": 10000, "regtest": 20000}
++ENV_DIR = {"main": "", "test": "-testnet", "regtest": "-regtest"}
++RANDOMX_FLAG_DEFAULT = 0
++RANDOMX_FLAG_FULL_MEM = 4
++RANDOMX_FLAG_V2 = 128
++
++
++def sha256d(b):
++    return hashlib.sha256(hashlib.sha256(b).digest()).digest()
++
++
++def merge_tree(leaves):
++    """Return (root, branches[slot]) for 8 leaves of 32 bytes (internal byte order)."""
++    l1 = [sha256d(leaves[2 * i] + leaves[2 * i + 1]) for i in range(4)]
++    l2 = [sha256d(l1[0] + l1[1]), sha256d(l1[2] + l1[3])]
++    root = sha256d(l2[0] + l2[1])
++    branches = [[leaves[s ^ 1], l1[(s >> 1) ^ 1], l2[(s >> 2) ^ 1]] for s in range(8)]
++    return root, branches
++
++
++def merge_root_from_branch(leaf, slot, branch):
++    node = leaf
++    for level in range(3):
++        node = sha256d(branch[level] + node) if (slot >> level) & 1 else sha256d(node + branch[level])
++    return node
++
++
++class RandomX:
++    def __init__(self, lib_path, fast=False):
++        self.lib = ctypes.CDLL(lib_path)
++        L = self.lib
++        L.randomx_get_flags.restype = ctypes.c_int
++        L.randomx_alloc_cache.restype = ctypes.c_void_p
++        L.randomx_alloc_cache.argtypes = [ctypes.c_int]
++        L.randomx_init_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
++        L.randomx_release_cache.argtypes = [ctypes.c_void_p]
++        L.randomx_alloc_dataset.restype = ctypes.c_void_p
++        L.randomx_alloc_dataset.argtypes = [ctypes.c_int]
++        L.randomx_dataset_item_count.restype = ctypes.c_ulong
++        L.randomx_init_dataset.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
++        L.randomx_release_dataset.argtypes = [ctypes.c_void_p]
++        L.randomx_create_vm.restype = ctypes.c_void_p
++        L.randomx_create_vm.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
++        L.randomx_destroy_vm.argtypes = [ctypes.c_void_p]
++        L.randomx_calculate_hash.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p]
++        self.fast = fast
++        self.key = None
++        self.version = None
++        self.cache = self.dataset = self.vm = None
++
++    def set_key(self, key, version):
++        if key == self.key and version == self.version:
++            return
++        self.release()
++        L = self.lib
++        flags = L.randomx_get_flags() | (RANDOMX_FLAG_V2 if version == 2 else 0)
++        self.cache = L.randomx_alloc_cache(flags)
++        L.randomx_init_cache(self.cache, key, len(key))
++        if self.fast:
++            self.dataset = L.randomx_alloc_dataset(flags)
++            L.randomx_init_dataset(self.dataset, self.cache, 0, L.randomx_dataset_item_count())
++            self.vm = L.randomx_create_vm(flags | RANDOMX_FLAG_FULL_MEM, None, self.dataset)
++        else:
++            self.vm = L.randomx_create_vm(flags, self.cache, None)
++        if not self.vm:
++            raise RuntimeError("cannot create RandomX virtual machine")
++        self.key, self.version = key, version
++
++    def hash(self, data):
++        out = ctypes.create_string_buffer(32)
++        self.lib.randomx_calculate_hash(self.vm, data, len(data), out)
++        return out.raw
++
++    def release(self):
++        L = self.lib
++        if self.vm: L.randomx_destroy_vm(self.vm)
++        if self.dataset: L.randomx_release_dataset(self.dataset)
++        if self.cache: L.randomx_release_cache(self.cache)
++        self.vm = self.dataset = self.cache = None
++
++
++class Node:
++    def __init__(self, coin, chain, datadir, host, rpcuser=None, rpcpassword=None):
++        self.coin = coin
++        self.slot, port = COINS[coin]
++        self.url = f"http://{host}:{port + ENV_OFFSET[chain]}/"
++        if rpcuser:
++            self.auth = f"{rpcuser}:{rpcpassword}"
++        else:
++            cookie = os.path.join(os.path.expanduser(datadir), coin + ENV_DIR[chain], ".cookie")
++            with open(cookie) as f:
++                self.auth = f.read().strip()
++
++    def call(self, method, *params):
++        body = json.dumps({"jsonrpc": "1.0", "id": "mm", "method": method, "params": list(params)}).encode()
++        req = urllib.request.Request(self.url, data=body, headers={
++            "Authorization": "Basic " + base64.b64encode(self.auth.encode()).decode(),
++            "Content-Type": "application/json"})
++        with urllib.request.urlopen(req, timeout=60) as r:
++            res = json.loads(r.read())
++        if res.get("error"):
++            raise RuntimeError(f"{self.coin} {method}: {res['error']}")
++        return res["result"]
++
++
++def mine(args):
++    rx = RandomX(args.lib, fast=args.fast)
++    nodes = []
++    for spec in args.coin:
++        name, addr = spec.split("=", 1)
++        nodes.append((Node(name, args.chain, args.datadir, args.host, args.rpcuser, args.rpcpassword), addr))
++    found_total = {n.coin: 0 for n, _ in nodes}
++    start = time.time()
++    hashes = 0
++    while args.blocks <= 0 or min(found_total.values()) < args.blocks:
++        t = int(time.time())
++        work = {}
++        for node, addr in nodes:
++            try:
++                w = node.call("getmergework", addr, t)
++            except RuntimeError as e:  # e.g. time not after median time past on a fast regtest chain
++                w = node.call("getmergework", addr)
++            work[node.coin] = (node, w)
++        keys = {w["randomxkey"] for _, w in work.values()}
++        versions = {w["randomxversion"] for _, w in work.values()}
++        if len(keys) != 1 or len(versions) != 1:
++            # Only chains that share one key can be mined together; take the most common key.
++            key = max(keys, key=lambda k: sum(1 for _, w in work.values() if w["randomxkey"] == k))
++            work = {c: v for c, v in work.items() if v[1]["randomxkey"] == key}
++        first = next(iter(work.values()))[1]
++        rx.set_key(bytes.fromhex(first["randomxkey"]), first["randomxversion"])
++
++        leaves = [bytes(32)] * 8
++        targets = {}
++        for coin, (node, w) in work.items():
++            leaves[w["slot"]] = bytes.fromhex(w["commitment"])[::-1]
++            targets[coin] = int(w["target"], 16)
++        root, branches = merge_tree(leaves)
++        pending = set(work)
++        deadline = time.time() + args.refresh
++        nonce = int.from_bytes(os.urandom(4), "little") << 24
++        while pending and time.time() < deadline:
++            h = rx.hash(root + struct.pack("<Q", nonce))
++            hashes += 1
++            value = int.from_bytes(h, "little")
++            for coin in list(pending):
++                if value <= targets[coin]:
++                    node, w = work[coin]
++                    br = [b[::-1].hex() for b in branches[w["slot"]]]
++                    res = node.call("submitmergework", w["commitment"], br, str(nonce))
++                    status = "accepted" if res.get("accepted") else f"rejected ({res.get('reason')})"
++                    print(f"[{time.strftime('%H:%M:%S')}] {coin:8s} height {w['height']:>6} nonce {nonce} {status}", flush=True)
++                    if res.get("accepted"):
++                        found_total[coin] += 1
++                    pending.discard(coin)
++            nonce += 1
++        # Refresh work after any block (other chains' commitments change only for chains that advanced,
++        # but a fresh common time keeps all five on one key).
++    elapsed = time.time() - start
++    print(f"done: {hashes} hashes in {elapsed:.1f}s ({hashes / max(elapsed, 1e-9):.1f} H/s); blocks: {found_total}")
++
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    p.add_argument("--lib", required=True, help="path to librandomx shared library")
++    p.add_argument("--chain", default="main", choices=["main", "test", "regtest"])
++    p.add_argument("--datadir", default="~/.bitcoin", help="node base data directory (for .cookie files)")
++    p.add_argument("--host", default="127.0.0.1")
++    p.add_argument("--rpcuser")
++    p.add_argument("--rpcpassword")
++    p.add_argument("--coin", action="append", required=True, help="name=reward_address, repeat per chain")
++    p.add_argument("--fast", action="store_true", help="RandomX fast mode (2 GiB dataset, much faster hashing)")
++    p.add_argument("--refresh", type=float, default=30.0, help="seconds before fetching fresh work")
++    p.add_argument("--blocks", type=int, default=0, help="stop after every chain has this many new blocks (0 = run forever)")
++    mine(p.parse_args())
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/contrib/coinseries/merge_smoke.sh b/contrib/coinseries/merge_smoke.sh
+new file mode 100755
+index 0000000..29657b4
+--- /dev/null
++++ b/contrib/coinseries/merge_smoke.sh
+@@ -0,0 +1,60 @@
++#!/usr/bin/env bash
++# Coin Series merged-mining smoke test (regtest):
++#  - five nodes, one merged miner mining all five chains with one RandomX computation per nonce
++#  - every chain must advance, blocks must survive a node restart (block index on disk)
++#  - a second Half node must sync the merged-mined chain over P2P (180-byte headers)
++# Usage: contrib/coinseries/merge_smoke.sh <build/bin> <librandomx.so> [randomx version]
++set -euo pipefail
++BIN=${1:-build/bin}
++LIB=${2:?path to librandomx shared library}
++RXV=${3:-1}
++HERE=$(cd "$(dirname "$0")" && pwd)
++WORK=$(mktemp -d)
++WORK2=$(mktemp -d)
++COINS="half quarter dime nickel cent"
++cleanup() {
++  for c in $COINS; do "$BIN/bitcoin-cli" -datadir="$WORK" -coin=$c -regtest stop >/dev/null 2>&1 || true; done
++  "$BIN/bitcoin-cli" -datadir="$WORK2" -coin=half -regtest -rpcport=58999 stop >/dev/null 2>&1 || true
++  sleep 3; rm -rf "$WORK" "$WORK2"
++}
++trap cleanup EXIT
++FAIL=0
++cli() { local c=$1; shift; "$BIN/bitcoin-cli" -datadir="$WORK" -coin=$c -regtest "$@"; }
++
++for c in $COINS; do "$BIN/bitcoind" -datadir="$WORK" -coin=$c -regtest -randomxversion=$RXV -daemon -listen=1 >/dev/null; done
++sleep 3
++ARGS=()
++for c in $COINS; do
++  cli $c -rpcwait createwallet w >/dev/null
++  ARGS+=(--coin "$c=$(cli $c getnewaddress)")
++done
++
++python3 "$HERE/merge_miner.py" --lib "$LIB" --chain regtest --datadir "$WORK" --blocks 20 --refresh 5 "${ARGS[@]}" | tail -4
++
++declare -A H
++for c in $COINS; do
++  H[$c]=$(cli $c getblockcount)
++  BAL=$(cli $c getbalances | python3 -c "import sys,json;b=json.load(sys.stdin)['mine'];print(b['trusted']+b['immature'])")
++  echo "$c height=${H[$c]} total_reward=$BAL"
++  [[ ${H[$c]} -ge 20 ]] || FAIL=1
++done
++
++# Header of a merged-mined block shows the merge branch and 64-bit nonce.
++cli dime getblockheader "$(cli dime getbestblockhash)" | python3 -c "
++import sys,json; h=json.load(sys.stdin); print('dime header keys:', sorted(k for k in h if k in ('nonce','nonce64','mergebranch')))"
++
++# Restart Half: chain must reload from disk with the new header format.
++BEST=$(cli half getbestblockhash)
++cli half stop >/dev/null; sleep 4
++"$BIN/bitcoind" -datadir="$WORK" -coin=half -regtest -randomxversion=$RXV -daemon -listen=1 >/dev/null
++sleep 2
++if [[ "$(cli half -rpcwait getbestblockhash)" == "$BEST" ]]; then echo "restart reload: PASS"; else echo "restart reload: FAIL"; FAIL=1; fi
++
++# A fresh Half node syncs the chain over P2P.
++"$BIN/bitcoind" -datadir="$WORK2" -coin=half -regtest -randomxversion=$RXV -daemon -listen=0 -rpcport=58999 -connect=127.0.0.1:58302 >/dev/null
++for i in $(seq 1 60); do
++  N=$("$BIN/bitcoin-cli" -datadir="$WORK2" -coin=half -regtest -rpcport=58999 -rpcwait getblockcount)
++  [[ "$N" == "${H[half]}" ]] && break; sleep 1
++done
++if [[ "$N" == "${H[half]}" ]]; then echo "p2p sync ($N blocks): PASS"; else echo "p2p sync: FAIL ($N of ${H[half]})"; FAIL=1; fi
++exit $FAIL
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index ad18115..ceb7698 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -53,6 +53,10 @@ target_link_libraries(bitcoin_clientversion
+ add_dependencies(bitcoin_clientversion generate_build_info)
+ 
+ add_subdirectory(crypto)
++# Coin Series: RandomX proof of work (BSD 3-Clause, vendored from https://github.com/tevador/RandomX, see randomx/VENDORED_COMMIT).
++# Built for a generic x86-64 target (hardware AES and JIT are detected at runtime), never -march=native.
++set(ARCH "default" CACHE STRING "RandomX target architecture")
++add_subdirectory(randomx EXCLUDE_FROM_ALL)
+ add_subdirectory(util)
+ if(ENABLE_IPC)
+   add_subdirectory(ipc)
+@@ -122,6 +126,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
+   outputtype.cpp
+   policy/feerate.cpp
+   policy/policy.cpp
++  coinseries_pow.cpp
+   pow.cpp
+   protocol.cpp
+   psbt.cpp
+@@ -143,6 +148,7 @@ target_link_libraries(bitcoin_common
+     bitcoin_util
+     univalue
+     secp256k1
++    randomx
+     Boost::headers
+     $<TARGET_NAME_IF_EXISTS:USDT::headers>
+     $<$<PLATFORM_ID:Windows>:ws2_32>
+diff --git a/src/chain.h b/src/chain.h
+index c278292..af062e7 100644
+--- a/src/chain.h
++++ b/src/chain.h
+@@ -18,6 +18,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <array>
+ #include <cstdint>
+ #include <string>
+ #include <vector>
+@@ -142,6 +143,9 @@ public:
+     uint32_t nTime{0};
+     uint32_t nBits{0};
+     uint32_t nNonce{0};
++    //! Coin Series header format: merge-tree siblings and 64-bit nonce
++    std::array<uint256, 3> vMergeBranch{};
++    uint64_t nNonce64{0};
+ 
+     //! (memory only) Sequential id assigned to distinguish order in which blocks are received.
+     //! Initialized to SEQ_ID_INIT_FROM_DISK{1} when loading blocks from disk, except for blocks
+@@ -156,7 +160,9 @@ public:
+           hashMerkleRoot{block.hashMerkleRoot},
+           nTime{block.nTime},
+           nBits{block.nBits},
+-          nNonce{block.nNonce}
++          nNonce{block.nNonce},
++          vMergeBranch{block.vMergeBranch},
++          nNonce64{block.nNonce64}
+     {
+     }
+ 
+@@ -192,6 +198,8 @@ public:
+         block.nTime = nTime;
+         block.nBits = nBits;
+         block.nNonce = nNonce;
++        block.vMergeBranch = vMergeBranch;
++        block.nNonce64 = nNonce64;
+         return block;
+     }
+ 
+@@ -356,7 +364,11 @@ public:
+         READWRITE(obj.hashMerkleRoot);
+         READWRITE(obj.nTime);
+         READWRITE(obj.nBits);
+-        READWRITE(obj.nNonce);
++        if (g_coin_series_header) {
++            READWRITE(obj.vMergeBranch[0], obj.vMergeBranch[1], obj.vMergeBranch[2], obj.nNonce64);
++        } else {
++            READWRITE(obj.nNonce);
++        }
+     }
+ 
+     uint256 ConstructBlockHash() const
+@@ -368,6 +380,8 @@ public:
+         block.nTime = nTime;
+         block.nBits = nBits;
+         block.nNonce = nNonce;
++        block.vMergeBranch = vMergeBranch;
++        block.nNonce64 = nNonce64;
+         return block.GetHash();
+     }
+ 
+diff --git a/src/chainparams.cpp b/src/chainparams.cpp
+index 93e21b0..f89a5b7 100644
+--- a/src/chainparams.cpp
++++ b/src/chainparams.cpp
+@@ -8,6 +8,7 @@
+ #include <chainparamsbase.h>
+ #include <common/args.h>
+ #include <consensus/amount.h>
++#include <primitives/block.h>
+ #include <consensus/params.h>
+ #include <deploymentinfo.h>
+ #include <logging.h>
+@@ -120,7 +121,7 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
+     if (const CoinSeriesId coin = GetCoinArg(args); coin != CoinSeriesId::NONE) {
+         auto opts = CChainParams::RegTestOptions{};
+         if (chain == ChainType::REGTEST) ReadRegTestArgs(args, opts);
+-        return CChainParams::CoinSeries(coin, chain, opts);
++        return CChainParams::CoinSeries(coin, chain, opts, args.GetIntArg("-randomxversion", 1));
+     }
+     switch (chain) {
+     case ChainType::MAIN:
+@@ -149,4 +150,6 @@ void SelectParams(const ChainType chain)
+     globalChainParams = CreateChainParams(gArgs, chain);
+     // Coin Series: per-chain money limit (21 million x multiplier; Bitcoin = 21 million).
+     SetMaxMoneyForMultiplier(globalChainParams->GetConsensus().nSupplyMultiplier);
++    // Coin Series: header serialization format (180-byte Coin Series header vs 80-byte Bitcoin header).
++    g_coin_series_header = globalChainParams->GetConsensus().nMergeSlot >= 0;
+ }
+diff --git a/src/chainparamsbase.cpp b/src/chainparamsbase.cpp
+index 8062f0d..21205a2 100644
+--- a/src/chainparamsbase.cpp
++++ b/src/chainparamsbase.cpp
+@@ -15,6 +15,7 @@
+ 
+ void SetupChainParamsBaseOptions(ArgsManager& argsman)
+ {
++    argsman.AddArg("-randomxversion=<n>", "Coin Series development: RandomX version for proof of work, 1 or 2 (default: 1). All nodes of a network must use the same value.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-coin=<coin>", "Coin Series: run the chain of <coin>. Allowed values: " LIST_COIN_NAMES ". Combine with -chain=main, test or regtest. Without -coin the software runs original Bitcoin (for regression testing only).", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-chain=<chain>", "Use the chain <chain> (default: main). Allowed values: " LIST_CHAIN_NAMES, ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-regtest", "Enter regression test mode, which uses a special chain in which blocks can be solved instantly. "
+diff --git a/src/coinseries_pow.cpp b/src/coinseries_pow.cpp
+new file mode 100644
+index 0000000..0098a69
+--- /dev/null
++++ b/src/coinseries_pow.cpp
+@@ -0,0 +1,148 @@
++// Copyright (c) 2026 Sento Daimon
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <coinseries_pow.h>
++
++#include <arith_uint256.h>
++#include <consensus/params.h>
++#include <crypto/common.h>
++#include <crypto/sha256.h>
++#include <hash.h>
++#include <pow.h>
++#include <primitives/block.h>
++#include <sync.h>
++
++#include <randomx.h>
++
++#include <list>
++#include <memory>
++#include <stdexcept>
++#include <string_view>
++
++namespace {
++constexpr std::string_view COMMIT_TAG{"coin-series/commit"};
++constexpr std::string_view KEY_TAG{"coin-series/randomx"};
++
++/** One initialized RandomX cache (light mode, ~256 MiB) with its virtual machine. */
++struct RandomXContext {
++    int version;
++    uint256 key;
++    randomx_cache* cache{nullptr};
++    randomx_vm* vm{nullptr};
++    RandomXContext(int ver, const uint256& k) : version{ver}, key{k}
++    {
++        randomx_flags flags = randomx_get_flags();
++        if (ver == 2) flags = flags | RANDOMX_FLAG_V2;
++        cache = randomx_alloc_cache(flags);
++        if (!cache) { // e.g. JIT not permitted: fall back to portable settings
++            flags = RANDOMX_FLAG_DEFAULT;
++            if (ver == 2) flags = flags | RANDOMX_FLAG_V2;
++            cache = randomx_alloc_cache(flags);
++        }
++        if (!cache) throw std::runtime_error("RandomX: cannot allocate cache");
++        randomx_init_cache(cache, key.begin(), key.size());
++        vm = randomx_create_vm(flags, cache, nullptr);
++        if (!vm) {
++            randomx_release_cache(cache);
++            throw std::runtime_error("RandomX: cannot create virtual machine");
++        }
++    }
++    ~RandomXContext()
++    {
++        if (vm) randomx_destroy_vm(vm);
++        if (cache) randomx_release_cache(cache);
++    }
++    RandomXContext(const RandomXContext&) = delete;
++    RandomXContext& operator=(const RandomXContext&) = delete;
++};
++
++Mutex g_randomx_mutex;
++//! Most recently used first. Two entries cover an epoch boundary without thrashing.
++std::list<std::unique_ptr<RandomXContext>> g_randomx_contexts GUARDED_BY(g_randomx_mutex);
++constexpr size_t MAX_RANDOMX_CONTEXTS{2};
++} // namespace
++
++uint256 CoinSeriesCommitHash(const CBlockHeader& header)
++{
++    HashWriter hw{};
++    hw.write(std::as_bytes(std::span{COMMIT_TAG.data(), COMMIT_TAG.size()}));
++    hw << header.nVersion << header.hashPrevBlock << header.hashMerkleRoot << header.nTime << header.nBits;
++    return hw.GetHash();
++}
++
++uint256 CoinSeriesMergeRoot(const uint256& leaf, int slot, const std::array<uint256, 3>& branch)
++{
++    uint256 node = leaf;
++    for (int level = 0; level < 3; ++level) {
++        if ((slot >> level) & 1) {
++            node = Hash(branch[level], node);
++        } else {
++            node = Hash(node, branch[level]);
++        }
++    }
++    return node;
++}
++
++uint256 CoinSeriesMergeRootFromLeaves(const std::array<uint256, COIN_SERIES_MERGE_LEAVES>& leaves)
++{
++    std::array<uint256, 4> l1;
++    for (int i = 0; i < 4; ++i) l1[i] = Hash(leaves[2 * i], leaves[2 * i + 1]);
++    const uint256 a = Hash(l1[0], l1[1]);
++    const uint256 b = Hash(l1[2], l1[3]);
++    return Hash(a, b);
++}
++
++std::array<uint256, 3> CoinSeriesMergeBranch(const std::array<uint256, COIN_SERIES_MERGE_LEAVES>& leaves, int slot)
++{
++    std::array<uint256, 4> l1;
++    for (int i = 0; i < 4; ++i) l1[i] = Hash(leaves[2 * i], leaves[2 * i + 1]);
++    std::array<uint256, 2> l2{Hash(l1[0], l1[1]), Hash(l1[2], l1[3])};
++    return {leaves[slot ^ 1], l1[(slot >> 1) ^ 1], l2[(slot >> 2) ^ 1]};
++}
++
++uint256 CoinSeriesRandomXKey(uint32_t time)
++{
++    const uint64_t epoch = uint64_t{time} / COIN_SERIES_RANDOMX_EPOCH_SECONDS;
++    unsigned char epoch_le[8];
++    WriteLE64(epoch_le, epoch);
++    uint256 key;
++    CSHA256().Write(reinterpret_cast<const unsigned char*>(KEY_TAG.data()), KEY_TAG.size()).Write(epoch_le, sizeof(epoch_le)).Finalize(key.begin());
++    return key;
++}
++
++uint256 CoinSeriesRandomXHash(int version, const uint256& key, const uint256& root, uint64_t nonce)
++{
++    unsigned char input[40];
++    std::copy(root.begin(), root.end(), input);
++    WriteLE64(input + 32, nonce);
++    uint256 result;
++
++    LOCK(g_randomx_mutex);
++    auto it = g_randomx_contexts.begin();
++    for (; it != g_randomx_contexts.end(); ++it) {
++        if ((*it)->version == version && (*it)->key == key) break;
++    }
++    if (it == g_randomx_contexts.end()) {
++        g_randomx_contexts.push_front(std::make_unique<RandomXContext>(version, key));
++        while (g_randomx_contexts.size() > MAX_RANDOMX_CONTEXTS) g_randomx_contexts.pop_back();
++    } else if (it != g_randomx_contexts.begin()) {
++        g_randomx_contexts.splice(g_randomx_contexts.begin(), g_randomx_contexts, it);
++    }
++    randomx_calculate_hash(g_randomx_contexts.front()->vm, input, sizeof(input), result.begin());
++    return result;
++}
++
++uint256 CoinSeriesPowHash(const CBlockHeader& header, const Consensus::Params& params)
++{
++    const uint256 root = CoinSeriesMergeRoot(CoinSeriesCommitHash(header), params.nMergeSlot, header.vMergeBranch);
++    return CoinSeriesRandomXHash(params.nRandomXVersion, CoinSeriesRandomXKey(header.nTime), root, header.nNonce64);
++}
++
++bool CheckCoinSeriesProofOfWork(const CBlockHeader& header, const Consensus::Params& params)
++{
++    if (params.nMergeSlot < 0 || params.nMergeSlot >= COIN_SERIES_MERGE_LEAVES) return false;
++    const auto target{DeriveTarget(header.nBits, params.powLimit)};
++    if (!target) return false;
++    return UintToArith256(CoinSeriesPowHash(header, params)) <= *target;
++}
+diff --git a/src/coinseries_pow.h b/src/coinseries_pow.h
+new file mode 100644
+index 0000000..af00682
+--- /dev/null
++++ b/src/coinseries_pow.h
+@@ -0,0 +1,47 @@
++// Copyright (c) 2026 Sento Daimon
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_COINSERIES_POW_H
++#define BITCOIN_COINSERIES_POW_H
++
++#include <uint256.h>
++
++#include <array>
++#include <cstdint>
++
++class CBlockHeader;
++namespace Consensus { struct Params; }
++
++/**
++ * Coin Series proof of work: RandomX over a five-chain merge tree.
++ *
++ *  1. commitment c = SHA256d("coin-series/commit" || 76-byte header body)
++ *     body = nVersion(4, LE) || hashPrevBlock(32) || hashMerkleRoot(32) || nTime(4, LE) || nBits(4, LE)
++ *  2. merge tree: 8 leaves, slot s holds the commitment of the chain with merge slot s
++ *     (Half 0, Quarter 1, Dime 2, Nickel 3, Cent 4), unused leaves are zero.
++ *     inner node = SHA256d(left || right). The header carries the 3 sibling hashes on the
++ *     path from the chain's own slot to the root (leaf level first).
++ *  3. key = SHA256("coin-series/randomx" || epoch(8, LE)), epoch = nTime / 1209600 (2 weeks)
++ *  4. pow = RandomX(key, root(32) || nNonce64(8, LE)); valid if pow (as a little-endian 256-bit
++ *     number, like Bitcoin block hashes) <= target(nBits) and target <= powLimit.
++ *
++ * The block identifier remains SHA256d of the full serialized header (body + PoW section).
++ */
++
++static constexpr int64_t COIN_SERIES_RANDOMX_EPOCH_SECONDS{1209600};
++static constexpr int COIN_SERIES_MERGE_LEAVES{8};
++
++uint256 CoinSeriesCommitHash(const CBlockHeader& header);
++uint256 CoinSeriesMergeRoot(const uint256& leaf, int slot, const std::array<uint256, 3>& branch);
++uint256 CoinSeriesMergeRootFromLeaves(const std::array<uint256, COIN_SERIES_MERGE_LEAVES>& leaves);
++std::array<uint256, 3> CoinSeriesMergeBranch(const std::array<uint256, COIN_SERIES_MERGE_LEAVES>& leaves, int slot);
++uint256 CoinSeriesRandomXKey(uint32_t time);
++/** RandomX hash (light mode, cached per key). Thread safe. version is 1 or 2. */
++uint256 CoinSeriesRandomXHash(int version, const uint256& key, const uint256& root, uint64_t nonce);
++/** Proof-of-work hash of a Coin Series header for the given chain. */
++uint256 CoinSeriesPowHash(const CBlockHeader& header, const Consensus::Params& params);
++/** Full proof-of-work check of a Coin Series header (merge tree + RandomX + target). */
++bool CheckCoinSeriesProofOfWork(const CBlockHeader& header, const Consensus::Params& params);
++
++#endif // BITCOIN_COINSERIES_POW_H
+diff --git a/src/consensus/params.h b/src/consensus/params.h
+index d0ac339..bfab372 100644
+--- a/src/consensus/params.h
++++ b/src/consensus/params.h
+@@ -92,6 +92,8 @@ struct Params {
+     int nMergeSlot{-1};
+     /** Coin Series: chain identifier committed in transaction signatures (0 = original Bitcoin) */
+     uint32_t nChainSigId{0};
++    /** Coin Series: RandomX version used for proof of work (1 or 2). Undecided; selectable for testing. */
++    int nRandomXVersion{1};
+     /**
+      * Hashes of blocks that
+      * - are known to be consensus valid, and
+diff --git a/src/headerssync.cpp b/src/headerssync.cpp
+index 039e7f6..f709b95 100644
+--- a/src/headerssync.cpp
++++ b/src/headerssync.cpp
+@@ -12,7 +12,9 @@
+ 
+ // Our memory analysis in headerssync-params.py assumes this many bytes for a
+ // CompressedHeader (we should re-calculate parameters if we compress further).
+-static_assert(sizeof(CompressedHeader) == 48);
++// Coin Series: the header carries 3 merge-tree hashes and a 64-bit nonce (+104 bytes).
++// Memory per redownloaded header is about 3x Bitcoin's; acceptable for the small Coin Series chains.
++static_assert(sizeof(CompressedHeader) == 152);
+ 
+ HeadersSyncState::HeadersSyncState(NodeId id,
+                                    const Consensus::Params& consensus_params,
+diff --git a/src/headerssync.h b/src/headerssync.h
+index 6d72087..d846f53 100644
+--- a/src/headerssync.h
++++ b/src/headerssync.h
+@@ -25,6 +25,8 @@ struct CompressedHeader {
+     uint32_t nTime{0};
+     uint32_t nBits{0};
+     uint32_t nNonce{0};
++    std::array<uint256, 3> vMergeBranch{}; // Coin Series
++    uint64_t nNonce64{0};                  // Coin Series
+ 
+     CompressedHeader()
+     {
+@@ -36,7 +38,9 @@ struct CompressedHeader {
+           hashMerkleRoot{header.hashMerkleRoot},
+           nTime{header.nTime},
+           nBits{header.nBits},
+-          nNonce{header.nNonce}
++          nNonce{header.nNonce},
++          vMergeBranch{header.vMergeBranch},
++          nNonce64{header.nNonce64}
+     {
+     }
+ 
+@@ -49,6 +53,8 @@ struct CompressedHeader {
+         ret.nTime = nTime;
+         ret.nBits = nBits;
+         ret.nNonce = nNonce;
++        ret.vMergeBranch = vMergeBranch;
++        ret.nNonce64 = nNonce64;
+         return ret;
+     };
+ };
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index 244f009..caa5933 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -41,6 +41,7 @@ add_library(bitcoinkernel
+   ../policy/rbf.cpp
+   ../policy/settings.cpp
+   ../policy/truc_policy.cpp
++  ../coinseries_pow.cpp
+   ../pow.cpp
+   ../primitives/block.cpp
+   ../primitives/transaction.cpp
+@@ -103,6 +104,7 @@ target_link_libraries(bitcoinkernel
+     core_interface
+     kernel_warn_interface
+     secp256k1_objs
++    randomx
+     $<$<PLATFORM_ID:Windows>:bcrypt>
+     $<TARGET_NAME_IF_EXISTS:USDT::headers>
+     Boost::headers
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index ce3817e..da7f544 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -139,7 +139,7 @@ public:
+         m_assumed_chain_state_size = 14;
+ 
+         genesis = CreateGenesisBlock(1231006505, 2083236893, 0x1d00ffff, 1, 50 * COIN);
+-        consensus.hashGenesisBlock = genesis.GetHash();
++        consensus.hashGenesisBlock = genesis.GetHashInFormat(/*coin_series=*/false);
+         assert(consensus.hashGenesisBlock == uint256{"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"});
+         assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+ 
+@@ -265,7 +265,7 @@ public:
+         m_assumed_chain_state_size = 19;
+ 
+         genesis = CreateGenesisBlock(1296688602, 414098458, 0x1d00ffff, 1, 50 * COIN);
+-        consensus.hashGenesisBlock = genesis.GetHash();
++        consensus.hashGenesisBlock = genesis.GetHashInFormat(/*coin_series=*/false);
+         assert(consensus.hashGenesisBlock == uint256{"000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"});
+         assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+ 
+@@ -381,7 +381,7 @@ public:
+                 0x1d00ffff,
+                 1,
+                 50 * COIN);
+-        consensus.hashGenesisBlock = genesis.GetHash();
++        consensus.hashGenesisBlock = genesis.GetHashInFormat(/*coin_series=*/false);
+         assert(consensus.hashGenesisBlock == uint256{"00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"});
+         assert(genesis.hashMerkleRoot == uint256{"7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"});
+ 
+@@ -521,7 +521,7 @@ public:
+         nPruneAfterHeight = 1000;
+ 
+         genesis = CreateGenesisBlock(1598918400, 52613770, 0x1e0377ae, 1, 50 * COIN);
+-        consensus.hashGenesisBlock = genesis.GetHash();
++        consensus.hashGenesisBlock = genesis.GetHashInFormat(/*coin_series=*/false);
+         assert(consensus.hashGenesisBlock == uint256{"00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"});
+         assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+ 
+@@ -639,7 +639,7 @@ public:
+         }
+ 
+         genesis = CreateGenesisBlock(1296688602, 2, 0x207fffff, 1, 50 * COIN);
+-        consensus.hashGenesisBlock = genesis.GetHash();
++        consensus.hashGenesisBlock = genesis.GetHashInFormat(/*coin_series=*/false);
+         assert(consensus.hashGenesisBlock == uint256{"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"});
+         assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+ 
+@@ -708,15 +708,15 @@ std::unique_ptr<const CChainParams> CChainParams::RegTest(const RegTestOptions&
+ /**
+  * Coin Series chain parameters (Half, Quarter, Dime, Nickel, Cent).
+  *
+- * Development stage: proof of work is still Bitcoin's SHA256d with placeholder
+- * limits, and the genesis block is a development placeholder. RandomX merged
+- * mining, ASERT difficulty with stall relief, signature chain identifiers,
+- * snapshot claims and the launch-bound genesis are added in later stages.
++ * Development stage: proof of work is RandomX over the five-chain merge tree
++ * (coinseries_pow.h) with placeholder limits, and the genesis block is a
++ * development placeholder. ASERT difficulty with stall relief, signature chain
++ * identifiers, snapshot claims and the launch-bound genesis come in later stages.
+  */
+ class CCoinSeriesParams : public CChainParams
+ {
+ public:
+-    CCoinSeriesParams(const CoinInfo& info, CoinEnv env, ChainType chain, const RegTestOptions& opts)
++    CCoinSeriesParams(const CoinInfo& info, CoinEnv env, ChainType chain, const RegTestOptions& opts, int randomx_version)
+     {
+         const size_t e = static_cast<size_t>(env);
+         m_chain_type = chain;
+@@ -732,6 +732,8 @@ public:
+         consensus.nMergeSlot = info.merge_slot;
+         // Chain identifier for signatures: distinct per coin and environment. Used from the signing stage.
+         consensus.nChainSigId = 0x43530000u | (uint32_t{info.merge_slot} << 8) | uint32_t(e);
++        // RandomX version (1 or 2): undecided, selectable during development.
++        consensus.nRandomXVersion = randomx_version;
+ 
+         // All of Bitcoin's rules (BIP34/65/66, CSV, SegWit, Taproot) are active from the first block.
+         consensus.BIP34Height = 1;
+@@ -750,8 +752,8 @@ public:
+             consensus.fPowNoRetargeting = true;
+             consensus.enforce_BIP94 = opts.enforce_bip94;
+         } else {
+-            // Placeholder until the RandomX / ASERT stage replaces proof of work and difficulty.
+-            consensus.powLimit = uint256{"00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
++            // Placeholder until the ASERT stage sets the real starting target and limit (RandomX: ~4096 hashes at the limit).
++            consensus.powLimit = uint256{"000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+             consensus.nPowTargetTimespan = 14 * 24 * 60 * 60;
+             consensus.fPowAllowMinDifficultyBlocks = (env == CoinEnv::TEST);
+             consensus.fPowNoRetargeting = false;
+@@ -810,9 +812,8 @@ public:
+         const std::string genesis_msg = strprintf("Coin Series %s %s development genesis", std::string{info.title}, std::string{CoinEnvName(env)});
+         const CScript genesis_script = CScript() << OP_RETURN;
+         genesis = CreateGenesisBlock(genesis_msg.c_str(), genesis_script, 1790812800, 0, genesis_bits, 1, /*genesisReward=*/0);
+-        const arith_uint256 target = arith_uint256().SetCompact(genesis_bits);
+-        while (UintToArith256(genesis.GetHash()) > target) ++genesis.nNonce;
+-        consensus.hashGenesisBlock = genesis.GetHash();
++        // Genesis is fixed by hash (exempt from proof of work), hashed in the Coin Series header format.
++        consensus.hashGenesisBlock = genesis.GetHashInFormat(/*coin_series=*/true);
+ 
+         vFixedSeeds.clear();
+         vSeeds.clear();
+@@ -841,14 +842,15 @@ public:
+     }
+ };
+ 
+-std::unique_ptr<const CChainParams> CChainParams::CoinSeries(CoinSeriesId coin, ChainType chain, const RegTestOptions& regtest_options)
++std::unique_ptr<const CChainParams> CChainParams::CoinSeries(CoinSeriesId coin, ChainType chain, const RegTestOptions& regtest_options, int randomx_version)
+ {
++    if (randomx_version != 1 && randomx_version != 2) throw std::runtime_error("RandomX version must be 1 or 2");
+     const CoinInfo* info = GetCoinInfo(coin);
+     const auto env = CoinEnvFromChainType(chain);
+     if (!info || !env) {
+         throw std::runtime_error(strprintf("Coin Series supports only -chain=main, test or regtest (got %s)", ChainTypeToString(chain)));
+     }
+-    return std::make_unique<const CCoinSeriesParams>(*info, *env, chain, regtest_options);
++    return std::make_unique<const CCoinSeriesParams>(*info, *env, chain, regtest_options, randomx_version);
+ }
+ 
+ std::unique_ptr<const CChainParams> CChainParams::Main()
+diff --git a/src/kernel/chainparams.h b/src/kernel/chainparams.h
+index 25ec78c..1b4e38e 100644
+--- a/src/kernel/chainparams.h
++++ b/src/kernel/chainparams.h
+@@ -161,7 +161,7 @@ public:
+     static std::unique_ptr<const CChainParams> TestNet();
+     static std::unique_ptr<const CChainParams> TestNet4();
+     /** Coin Series chain parameters for one coin and one environment (main / test / regtest). */
+-    static std::unique_ptr<const CChainParams> CoinSeries(CoinSeriesId coin, ChainType chain, const RegTestOptions& regtest_options);
++    static std::unique_ptr<const CChainParams> CoinSeries(CoinSeriesId coin, ChainType chain, const RegTestOptions& regtest_options, int randomx_version = 1);
+ 
+ protected:
+     CChainParams() = default;
+diff --git a/src/node/blockstorage.cpp b/src/node/blockstorage.cpp
+index ab6d23e..8c5b01f 100644
+--- a/src/node/blockstorage.cpp
++++ b/src/node/blockstorage.cpp
+@@ -142,10 +142,12 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
+                 pindexNew->nTime          = diskindex.nTime;
+                 pindexNew->nBits          = diskindex.nBits;
+                 pindexNew->nNonce         = diskindex.nNonce;
++                pindexNew->vMergeBranch   = diskindex.vMergeBranch;
++                pindexNew->nNonce64       = diskindex.nNonce64;
+                 pindexNew->nStatus        = diskindex.nStatus;
+                 pindexNew->nTx            = diskindex.nTx;
+ 
+-                if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
++                if (!CheckStoredProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
+                     LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
+                     return false;
+                 }
+@@ -1054,7 +1056,7 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
+     const auto block_hash{block.GetHash()};
+ 
+     // Check the header
+-    if (!CheckProofOfWork(block_hash, block.nBits, GetConsensus())) {
++    if (!CheckStoredProofOfWork(block_hash, block.nBits, GetConsensus())) {
+         LogError("Errors in block header at %s while reading block", pos.ToString());
+         return false;
+     }
+diff --git a/src/pow.cpp b/src/pow.cpp
+index 9a9f4e5..e5f4ff8 100644
+--- a/src/pow.cpp
++++ b/src/pow.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include <pow.h>
+ 
++#include <coinseries_pow.h>
++
+ #include <arith_uint256.h>
+ #include <chain.h>
+ #include <primitives/block.h>
+@@ -143,6 +145,21 @@ bool CheckProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params&
+     return CheckProofOfWorkImpl(hash, nBits, params);
+ }
+ 
++bool CheckProofOfWork(const CBlockHeader& header, const Consensus::Params& params)
++{
++    if (params.nMergeSlot < 0) return CheckProofOfWork(header.GetHash(), header.nBits, params);
++    if (header.hashPrevBlock.IsNull() && header.GetHash() == params.hashGenesisBlock) return true;
++    if (EnableFuzzDeterminism()) return DeriveTarget(header.nBits, params.powLimit).has_value();
++    return CheckCoinSeriesProofOfWork(header, params);
++}
++
++bool CheckStoredProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params& params)
++{
++    if (params.nMergeSlot < 0) return CheckProofOfWork(hash, nBits, params);
++    if (hash == params.hashGenesisBlock) return true;
++    return DeriveTarget(nBits, params.powLimit).has_value();
++}
++
+ std::optional<arith_uint256> DeriveTarget(unsigned int nBits, const uint256 pow_limit)
+ {
+     bool fNegative;
+diff --git a/src/pow.h b/src/pow.h
+index 26004c4..3c5e6ee 100644
+--- a/src/pow.h
++++ b/src/pow.h
+@@ -32,6 +32,18 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
+ /** Check whether a block hash satisfies the proof-of-work requirement specified by nBits */
+ bool CheckProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params&);
+ bool CheckProofOfWorkImpl(uint256 hash, unsigned int nBits, const Consensus::Params&);
++/**
++ * Coin Series: full proof-of-work check of a header. For original Bitcoin this is the
++ * block hash check above; for Coin Series chains it is the merge tree + RandomX check.
++ * The genesis block of a Coin Series chain is fixed by hash and exempt.
++ */
++bool CheckProofOfWork(const CBlockHeader& header, const Consensus::Params&);
++/**
++ * Coin Series: check for headers that were fully validated before (block index load,
++ * reading blocks back from disk). Bitcoin: unchanged hash check. Coin Series: the target
++ * must be in range; RandomX is not repeated because it is far too slow for this purpose.
++ */
++bool CheckStoredProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params&);
+ 
+ /**
+  * Return false if the proof-of-work requirement specified by new_nbits at a
+diff --git a/src/primitives/block.cpp b/src/primitives/block.cpp
+index dfeed29..ed078bd 100644
+--- a/src/primitives/block.cpp
++++ b/src/primitives/block.cpp
+@@ -17,6 +17,18 @@ uint256 CBlockHeader::GetHash() const
+     return (HashWriter{} << *this).GetHash();
+ }
+ 
++uint256 CBlockHeader::GetHashInFormat(bool coin_series) const
++{
++    HashWriter hw{};
++    hw << nVersion << hashPrevBlock << hashMerkleRoot << nTime << nBits;
++    if (coin_series) {
++        hw << vMergeBranch[0] << vMergeBranch[1] << vMergeBranch[2] << nNonce64;
++    } else {
++        hw << nNonce;
++    }
++    return hw.GetHash();
++}
++
+ std::string CBlock::ToString() const
+ {
+     std::stringstream s;
+diff --git a/src/primitives/block.h b/src/primitives/block.h
+index 8ca4fb4..ac8c9fb 100644
+--- a/src/primitives/block.h
++++ b/src/primitives/block.h
+@@ -11,6 +11,7 @@
+ #include <uint256.h>
+ #include <util/time.h>
+ 
++#include <array>
+ #include <cstdint>
+ #include <string>
+ #include <utility>
+@@ -23,6 +24,25 @@
+  * in the block is a special one that creates a new coin owned by the creator
+  * of the block.
+  */
++/**
++ * Coin Series: when true, block headers use the Coin Series format
++ * (76-byte body + 3 merge-tree sibling hashes + 64-bit nonce = 180 bytes)
++ * instead of Bitcoin's 80-byte format. Set once at startup by SelectParams()
++ * for Coin Series chains, before any header is serialized.
++ */
++inline bool g_coin_series_header{false};
++
++/** RAII helper to serialize headers in a given format temporarily (genesis construction, tests). */
++class CoinSeriesHeaderScope
++{
++    bool m_prev;
++public:
++    explicit CoinSeriesHeaderScope(bool on) : m_prev{g_coin_series_header} { g_coin_series_header = on; }
++    ~CoinSeriesHeaderScope() { g_coin_series_header = m_prev; }
++    CoinSeriesHeaderScope(const CoinSeriesHeaderScope&) = delete;
++    CoinSeriesHeaderScope& operator=(const CoinSeriesHeaderScope&) = delete;
++};
++
+ class CBlockHeader
+ {
+ public:
+@@ -32,14 +52,25 @@ public:
+     uint256 hashMerkleRoot;
+     uint32_t nTime;
+     uint32_t nBits;
+-    uint32_t nNonce;
++    uint32_t nNonce;            //!< Bitcoin format only
++    // Coin Series format only: proof-of-work section
++    std::array<uint256, 3> vMergeBranch{}; //!< sibling hashes of the 8-leaf merge tree, leaf level first
++    uint64_t nNonce64{0};
+ 
+     CBlockHeader()
+     {
+         SetNull();
+     }
+ 
+-    SERIALIZE_METHODS(CBlockHeader, obj) { READWRITE(obj.nVersion, obj.hashPrevBlock, obj.hashMerkleRoot, obj.nTime, obj.nBits, obj.nNonce); }
++    SERIALIZE_METHODS(CBlockHeader, obj)
++    {
++        READWRITE(obj.nVersion, obj.hashPrevBlock, obj.hashMerkleRoot, obj.nTime, obj.nBits);
++        if (g_coin_series_header) {
++            READWRITE(obj.vMergeBranch[0], obj.vMergeBranch[1], obj.vMergeBranch[2], obj.nNonce64);
++        } else {
++            READWRITE(obj.nNonce);
++        }
++    }
+ 
+     void SetNull()
+     {
+@@ -49,6 +80,8 @@ public:
+         nTime = 0;
+         nBits = 0;
+         nNonce = 0;
++        vMergeBranch = {};
++        nNonce64 = 0;
+     }
+ 
+     bool IsNull() const
+@@ -57,6 +90,8 @@ public:
+     }
+ 
+     uint256 GetHash() const;
++    /** Hash in an explicit header format, independent of g_coin_series_header (used for genesis blocks). */
++    uint256 GetHashInFormat(bool coin_series) const;
+ 
+     NodeSeconds Time() const
+     {
+diff --git a/src/rpc/blockchain.cpp b/src/rpc/blockchain.cpp
+index c631a93..866d145 100644
+--- a/src/rpc/blockchain.cpp
++++ b/src/rpc/blockchain.cpp
+@@ -168,6 +168,13 @@ UniValue blockheaderToJSON(const CBlockIndex& tip, const CBlockIndex& blockindex
+     result.pushKV("time", blockindex.nTime);
+     result.pushKV("mediantime", blockindex.GetMedianTimePast());
+     result.pushKV("nonce", blockindex.nNonce);
++    if (g_coin_series_header) {
++        // Coin Series: proof-of-work section of the header
++        result.pushKV("nonce64", strprintf("%u", blockindex.nNonce64));
++        UniValue branch(UniValue::VARR);
++        for (const auto& h : blockindex.vMergeBranch) branch.push_back(h.GetHex());
++        result.pushKV("mergebranch", std::move(branch));
++    }
+     result.pushKV("bits", strprintf("%08x", blockindex.nBits));
+     result.pushKV("target", GetTarget(blockindex, pow_limit).GetHex());
+     result.pushKV("difficulty", GetDifficulty(blockindex));
+@@ -619,6 +626,8 @@ static RPCHelpMan getblockheader()
+                             {RPCResult::Type::NUM_TIME, "time", "The block time expressed in " + UNIX_EPOCH_TIME},
+                             {RPCResult::Type::NUM_TIME, "mediantime", "The median block time expressed in " + UNIX_EPOCH_TIME},
+                             {RPCResult::Type::NUM, "nonce", "The nonce"},
++                    {RPCResult::Type::STR, "nonce64", /*optional=*/true, "Coin Series: 64-bit nonce (decimal string)"},
++                    {RPCResult::Type::ARR, "mergebranch", /*optional=*/true, "Coin Series: merge tree sibling hashes", {{RPCResult::Type::STR_HEX, "", "hash"}}},
+                             {RPCResult::Type::STR_HEX, "bits", "nBits: compact representation of the block difficulty target"},
+                             {RPCResult::Type::STR_HEX, "target", "The difficulty target"},
+                             {RPCResult::Type::NUM, "difficulty", "The difficulty"},
+@@ -799,6 +808,8 @@ static RPCHelpMan getblock()
+                     {RPCResult::Type::NUM_TIME, "time",       "The block time expressed in " + UNIX_EPOCH_TIME},
+                     {RPCResult::Type::NUM_TIME, "mediantime", "The median block time expressed in " + UNIX_EPOCH_TIME},
+                     {RPCResult::Type::NUM, "nonce", "The nonce"},
++                    {RPCResult::Type::STR, "nonce64", /*optional=*/true, "Coin Series: 64-bit nonce (decimal string)"},
++                    {RPCResult::Type::ARR, "mergebranch", /*optional=*/true, "Coin Series: merge tree sibling hashes", {{RPCResult::Type::STR_HEX, "", "hash"}}},
+                     {RPCResult::Type::STR_HEX, "bits", "nBits: compact representation of the block difficulty target"},
+                     {RPCResult::Type::STR_HEX, "target", "The difficulty target"},
+                     {RPCResult::Type::NUM, "difficulty", "The difficulty"},
+diff --git a/src/rpc/client.cpp b/src/rpc/client.cpp
+index 8422af1..f787f20 100644
+--- a/src/rpc/client.cpp
++++ b/src/rpc/client.cpp
+@@ -61,6 +61,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
+     { "utxoupdatepsbt", 0, "psbt", ParamFormat::STRING },
+     { "utxoupdatepsbt", 1, "descriptors" },
+     { "generatetoaddress", 0, "nblocks" },
++    { "getmergework", 1, "time" },
++    { "submitmergework", 1, "branch" },
+     { "generatetoaddress", 2, "maxtries" },
+     { "generatetodescriptor", 0, "num_blocks" },
+     { "generatetodescriptor", 2, "maxtries" },
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index 043e11f..6b1605d 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <chain.h>
+ #include <chainparams.h>
++#include <coinseries_pow.h>
+ #include <chainparamsbase.h>
+ #include <common/system.h>
+ #include <consensus/amount.h>
+@@ -44,6 +45,8 @@
+ #include <validationinterface.h>
+ 
+ #include <cstdint>
++#include <deque>
++#include <map>
+ #include <memory>
+ 
+ using interfaces::BlockRef;
+@@ -139,6 +142,27 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
+     block_out.reset();
+     block.hashMerkleRoot = BlockMerkleRoot(block);
+ 
++    if (chainman.GetConsensus().nMergeSlot >= 0) {
++        // Coin Series: solo mining of this chain only. The other merge-tree slots are empty.
++        const auto& consensus = chainman.GetConsensus();
++        std::array<uint256, COIN_SERIES_MERGE_LEAVES> leaves{};
++        leaves[consensus.nMergeSlot] = CoinSeriesCommitHash(block);
++        block.vMergeBranch = CoinSeriesMergeBranch(leaves, consensus.nMergeSlot);
++        while (max_tries > 0 && !CheckProofOfWork(static_cast<const CBlockHeader&>(block), consensus) && !chainman.m_interrupt) {
++            ++block.nNonce64;
++            --max_tries;
++        }
++        if (max_tries == 0 || chainman.m_interrupt) {
++            return false;
++        }
++        block_out = std::make_shared<const CBlock>(std::move(block));
++        if (!process_new_block) return true;
++        if (!chainman.ProcessNewBlock(block_out, /*force_processing=*/true, /*min_pow_checked=*/true, nullptr)) {
++            throw JSONRPCError(RPC_INTERNAL_ERROR, "ProcessNewBlock, block not accepted");
++        }
++        return true;
++    }
++
+     while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() && !CheckProofOfWork(block.GetHash(), block.nBits, chainman.GetConsensus()) && !chainman.m_interrupt) {
+         ++block.nNonce;
+         --max_tries;
+@@ -1138,6 +1162,155 @@ static RPCHelpMan submitheader()
+     };
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// Coin Series merged mining.
++//
++// A merged miner asks each of the five nodes for work (getmergework), builds the 8-leaf merge
++// tree from the five commitments, runs RandomX on root || nonce64 and, for every chain whose
++// target is met, returns that chain's three sibling hashes and the nonce (submitmergework).
++// The node keeps the full block for each piece of work it handed out.
++// ---------------------------------------------------------------------------
++namespace {
++Mutex g_merge_work_mutex;
++std::map<uint256, std::shared_ptr<CBlock>> g_merge_work GUARDED_BY(g_merge_work_mutex);
++std::deque<uint256> g_merge_work_order GUARDED_BY(g_merge_work_mutex);
++constexpr size_t MAX_MERGE_WORK{256};
++} // namespace
++
++static RPCHelpMan getmergework()
++{
++    return RPCHelpMan{"getmergework",
++        "Coin Series: create a block for merged mining and return its commitment.\n"
++        "Use the same time for all five chains so that they share one RandomX key.",
++        {
++            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Address that receives the block reward."},
++            {"time", RPCArg::Type::NUM, RPCArg::DefaultHint{"current time"}, "Header time (seconds since epoch)."},
++        },
++        RPCResult{
++            RPCResult::Type::OBJ, "", "",
++            {
++                {RPCResult::Type::STR_HEX, "commitment", "commitment hash of the 76-byte header body (merge tree leaf)"},
++                {RPCResult::Type::NUM, "slot", "merge tree slot of this chain (0..4)"},
++                {RPCResult::Type::STR_HEX, "target", "proof-of-work target this chain requires"},
++                {RPCResult::Type::STR_HEX, "bits", "compact target"},
++                {RPCResult::Type::NUM, "time", "header time"},
++                {RPCResult::Type::NUM, "height", "height of the new block"},
++                {RPCResult::Type::NUM, "randomxversion", "RandomX version (1 or 2)"},
++                {RPCResult::Type::STR_HEX, "randomxkey", "RandomX key for this header time"},
++            }},
++        RPCExamples{HelpExampleCli("getmergework", "\"myaddress\"")},
++        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    NodeContext& node = EnsureAnyNodeContext(request.context);
++    Mining& miner = EnsureMining(node);
++    ChainstateManager& chainman = EnsureChainman(node);
++    const auto& consensus = chainman.GetConsensus();
++    if (consensus.nMergeSlot < 0) throw JSONRPCError(RPC_METHOD_NOT_FOUND, "getmergework is only available on Coin Series chains");
++
++    const CTxDestination destination = DecodeDestination(request.params[0].get_str());
++    if (!IsValidDestination(destination)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Error: Invalid address");
++
++    std::unique_ptr<BlockTemplate> block_template(miner.createNewBlock({.coinbase_output_script = GetScriptForDestination(destination), .include_dummy_extranonce = true}, /*cooldown=*/false));
++    CHECK_NONFATAL(block_template);
++    auto block = std::make_shared<CBlock>(block_template->getBlock());
++
++    int height;
++    {
++        LOCK(cs_main);
++        const CBlockIndex* prev = chainman.m_blockman.LookupBlockIndex(block->hashPrevBlock);
++        CHECK_NONFATAL(prev);
++        height = prev->nHeight + 1;
++        if (!request.params[1].isNull()) {
++            const int64_t t = request.params[1].getInt<int64_t>();
++            if (t <= prev->GetMedianTimePast()) throw JSONRPCError(RPC_INVALID_PARAMETER, "time must be later than the median time of the last 11 blocks");
++            if (t > GetTime() + MAX_FUTURE_BLOCK_TIME) throw JSONRPCError(RPC_INVALID_PARAMETER, "time is too far in the future");
++            block->nTime = static_cast<uint32_t>(t);
++            // The required target can depend on the header time (difficulty rules).
++            block->nBits = GetNextWorkRequired(prev, block.get(), consensus);
++        }
++    }
++    block->hashMerkleRoot = BlockMerkleRoot(*block);
++    const uint256 commitment = CoinSeriesCommitHash(*block);
++    {
++        LOCK(g_merge_work_mutex);
++        if (g_merge_work.emplace(commitment, block).second) g_merge_work_order.push_back(commitment);
++        while (g_merge_work_order.size() > MAX_MERGE_WORK) {
++            g_merge_work.erase(g_merge_work_order.front());
++            g_merge_work_order.pop_front();
++        }
++    }
++    UniValue result(UniValue::VOBJ);
++    result.pushKV("commitment", commitment.GetHex());
++    result.pushKV("slot", consensus.nMergeSlot);
++    result.pushKV("target", DeriveTarget(block->nBits, consensus.powLimit).value_or(arith_uint256{}).GetHex());
++    result.pushKV("bits", strprintf("%08x", block->nBits));
++    result.pushKV("time", block->nTime);
++    result.pushKV("height", height);
++    result.pushKV("randomxversion", consensus.nRandomXVersion);
++    result.pushKV("randomxkey", HexStr(CoinSeriesRandomXKey(block->nTime)));
++    return result;
++},
++    };
++}
++
++static RPCHelpMan submitmergework()
++{
++    return RPCHelpMan{"submitmergework",
++        "Coin Series: submit a merged-mining solution for work obtained with getmergework.",
++        {
++            {"commitment", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "commitment returned by getmergework"},
++            {"branch", RPCArg::Type::ARR, RPCArg::Optional::NO, "the three merge tree sibling hashes, leaf level first",
++                {{"hash", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
++            {"nonce", RPCArg::Type::STR, RPCArg::Optional::NO, "64-bit nonce as a decimal string"},
++        },
++        RPCResult{RPCResult::Type::OBJ, "", "",
++            {
++                {RPCResult::Type::BOOL, "accepted", "whether the block was accepted"},
++                {RPCResult::Type::STR_HEX, "hash", "block hash"},
++                {RPCResult::Type::STR, "reason", /*optional=*/true, "reason if not accepted"},
++            }},
++        RPCExamples{HelpExampleCli("submitmergework", "\"commitment\" '[\"h1\",\"h2\",\"h3\"]' \"12345\"")},
++        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    NodeContext& node = EnsureAnyNodeContext(request.context);
++    ChainstateManager& chainman = EnsureChainman(node);
++    const auto& consensus = chainman.GetConsensus();
++    if (consensus.nMergeSlot < 0) throw JSONRPCError(RPC_METHOD_NOT_FOUND, "submitmergework is only available on Coin Series chains");
++
++    const uint256 commitment = ParseHashV(request.params[0], "commitment");
++    const UniValue& branch = request.params[1].get_array();
++    if (branch.size() != 3) throw JSONRPCError(RPC_INVALID_PARAMETER, "branch must contain exactly 3 hashes");
++    const auto nonce = ToIntegral<uint64_t>(request.params[2].get_str());
++    if (!nonce) throw JSONRPCError(RPC_INVALID_PARAMETER, "invalid nonce");
++
++    std::shared_ptr<CBlock> block;
++    {
++        LOCK(g_merge_work_mutex);
++        auto it = g_merge_work.find(commitment);
++        if (it == g_merge_work.end()) throw JSONRPCError(RPC_INVALID_PARAMETER, "unknown or expired work");
++        block = std::make_shared<CBlock>(*it->second);
++    }
++    for (int i = 0; i < 3; ++i) block->vMergeBranch[i] = ParseHashV(branch[i], "branch");
++    block->nNonce64 = *nonce;
++
++    UniValue result(UniValue::VOBJ);
++    result.pushKV("hash", block->GetHash().GetHex());
++    if (!CheckProofOfWork(static_cast<const CBlockHeader&>(*block), consensus)) {
++        result.pushKV("accepted", false);
++        result.pushKV("reason", "proof of work does not meet this chain's target");
++        return result;
++    }
++    bool new_block{false};
++    const bool accepted = chainman.ProcessNewBlock(block, /*force_processing=*/true, /*min_pow_checked=*/true, &new_block);
++    result.pushKV("accepted", accepted && new_block);
++    if (!accepted) result.pushKV("reason", "block rejected");
++    else if (!new_block) result.pushKV("reason", "duplicate");
++    return result;
++},
++    };
++}
++
+ void RegisterMiningRPCCommands(CRPCTable& t)
+ {
+     static const CRPCCommand commands[]{
+@@ -1148,6 +1321,8 @@ void RegisterMiningRPCCommands(CRPCTable& t)
+         {"mining", &getblocktemplate},
+         {"mining", &submitblock},
+         {"mining", &submitheader},
++        {"mining", &getmergework},
++        {"mining", &submitmergework},
+ 
+         {"hidden", &generatetoaddress},
+         {"hidden", &generatetodescriptor},
+diff --git a/src/test/coinseries_tests.cpp b/src/test/coinseries_tests.cpp
+index cce2d05..a8d20a0 100644
+--- a/src/test/coinseries_tests.cpp
++++ b/src/test/coinseries_tests.cpp
+@@ -12,7 +12,10 @@
+ #include <key.h>
+ #include <key_io.h>
+ #include <kernel/coinseries.h>
++#include <coinseries_pow.h>
++#include <hash.h>
+ #include <pow.h>
++#include <streams.h>
+ #include <script/script.h>
+ #include <util/chaintype.h>
+ #include <validation.h>
+@@ -104,8 +107,9 @@ BOOST_AUTO_TEST_CASE(genesis_is_valid)
+         for (ChainType env : ENVS) {
+             auto p = Make(info.coin, env);
+             const CBlock& g = p->GenesisBlock();
++            CoinSeriesHeaderScope header_format{true};
+             BOOST_CHECK(g.GetHash() == p->GetConsensus().hashGenesisBlock);
+-            BOOST_CHECK(CheckProofOfWork(g.GetHash(), g.nBits, p->GetConsensus()));
++            BOOST_CHECK(CheckProofOfWork(static_cast<const CBlockHeader&>(g), p->GetConsensus()));
+             BOOST_CHECK_EQUAL(g.vtx[0]->GetValueOut(), 0);
+             BOOST_CHECK_EQUAL(GetBlockSubsidy(0, p->GetConsensus()), 0);
+         }
+@@ -188,4 +192,103 @@ BOOST_AUTO_TEST_CASE(money_limit_per_chain)
+     BOOST_CHECK(!MoneyRange(21000000 * COIN + 1));
+ }
+ 
++// Header format: 76-byte body + 3 x 32-byte merge siblings + 8-byte nonce = 180 bytes.
++BOOST_AUTO_TEST_CASE(header_format)
++{
++    CBlockHeader h;
++    h.nVersion = 4;
++    h.nTime = 1790812800;
++    h.nBits = 0x207fffff;
++    h.vMergeBranch = {uint256::ONE, uint256{2}, uint256{3}};
++    h.nNonce64 = 0x0123456789abcdefULL;
++    {
++        CoinSeriesHeaderScope on{true};
++        DataStream ds{};
++        ds << h;
++        BOOST_CHECK_EQUAL(ds.size(), 180U);
++        CBlockHeader back;
++        ds >> back;
++        BOOST_CHECK(back.GetHash() == h.GetHash());
++        BOOST_CHECK(back.vMergeBranch == h.vMergeBranch);
++        BOOST_CHECK_EQUAL(back.nNonce64, h.nNonce64);
++    }
++    DataStream ds{};
++    ds << h;
++    BOOST_CHECK_EQUAL(ds.size(), 80U); // original Bitcoin format unchanged
++}
++
++// Merge tree: the branch for each slot rebuilds the same root as the full tree.
++BOOST_AUTO_TEST_CASE(merge_tree)
++{
++    std::array<uint256, COIN_SERIES_MERGE_LEAVES> leaves{};
++    for (int i = 0; i < 5; ++i) leaves[i] = Hash(std::vector<unsigned char>{(unsigned char)i});
++    const uint256 root = CoinSeriesMergeRootFromLeaves(leaves);
++    for (int slot = 0; slot < COIN_SERIES_MERGE_LEAVES; ++slot) {
++        const auto branch = CoinSeriesMergeBranch(leaves, slot);
++        BOOST_CHECK(CoinSeriesMergeRoot(leaves[slot], slot, branch) == root);
++        // A chain's commitment placed in a different slot gives a different root
++        // (checked for the five used slots; unused slots are all zero and interchangeable).
++        if (slot < 5) BOOST_CHECK(CoinSeriesMergeRoot(leaves[slot], slot ^ 1, branch) != root);
++    }
++}
++
++// RandomX key changes every 2 weeks and depends only on the header time.
++BOOST_AUTO_TEST_CASE(randomx_key_epochs)
++{
++    const uint32_t t0 = 1209600 * 1480;
++    BOOST_CHECK(CoinSeriesRandomXKey(t0) == CoinSeriesRandomXKey(t0 + 1209599));
++    BOOST_CHECK(CoinSeriesRandomXKey(t0) != CoinSeriesRandomXKey(t0 + 1209600));
++    BOOST_CHECK(CoinSeriesRandomXKey(t0) != CoinSeriesRandomXKey(t0 - 1));
++}
++
++// Proof of work: a solved header is accepted only for its own slot and only unmodified.
++BOOST_AUTO_TEST_CASE(randomx_proof_of_work)
++{
++    CoinSeriesHeaderScope on{true};
++    for (int version : {1, 2}) {
++        auto half = CChainParams::CoinSeries(CoinSeriesId::HALF, ChainType::REGTEST, {}, version);
++        auto cent = CChainParams::CoinSeries(CoinSeriesId::CENT, ChainType::REGTEST, {}, version);
++        Consensus::Params c = half->GetConsensus();
++        c.powLimit = uint256{"00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}; // ~1 in 256 hashes
++
++        CBlockHeader h;
++        h.nVersion = 0x20000000;
++        h.hashPrevBlock = uint256::ONE;
++        h.hashMerkleRoot = uint256{7};
++        h.nTime = 1790812800;
++        h.nBits = UintToArith256(c.powLimit).GetCompact();
++        std::array<uint256, COIN_SERIES_MERGE_LEAVES> leaves{};
++        leaves[c.nMergeSlot] = CoinSeriesCommitHash(h);
++        leaves[4] = uint256{99}; // some other chain's commitment in the Cent slot
++        h.vMergeBranch = CoinSeriesMergeBranch(leaves, c.nMergeSlot);
++        int tries = 0;
++        while (!CheckProofOfWork(h, c) && tries < 20000) { ++h.nNonce64; ++tries; }
++        BOOST_REQUIRE(CheckProofOfWork(h, c));
++        BOOST_TEST_MESSAGE("RandomX v" << version << ": solved after " << tries + 1 << " hashes");
++        // Deterministic: the proof-of-work hash is reproducible.
++        BOOST_CHECK(CoinSeriesPowHash(h, c) == CoinSeriesPowHash(h, c));
++
++        // The same header is not valid for another chain (different slot).
++        Consensus::Params cc = cent->GetConsensus();
++        cc.powLimit = c.powLimit;
++        BOOST_CHECK(CoinSeriesPowHash(h, cc) != CoinSeriesPowHash(h, c));
++
++        // Changing any committed field changes the proof-of-work hash.
++        CBlockHeader t = h; t.nTime += 1;
++        BOOST_CHECK(CoinSeriesPowHash(t, c) != CoinSeriesPowHash(h, c));
++        t = h; t.hashMerkleRoot = uint256{8};
++        BOOST_CHECK(CoinSeriesPowHash(t, c) != CoinSeriesPowHash(h, c));
++        t = h; t.vMergeBranch[2] = uint256{5};
++        BOOST_CHECK(CoinSeriesPowHash(t, c) != CoinSeriesPowHash(h, c));
++        t = h; t.nNonce64 += 1;
++        BOOST_CHECK(CoinSeriesPowHash(t, c) != CoinSeriesPowHash(h, c));
++        // A target above the limit is rejected.
++        t = h; t.nBits = 0x207fffff;
++        BOOST_CHECK(!CheckProofOfWork(t, c));
++    }
++    // RandomX v1 and v2 give different hashes for the same input.
++    const uint256 key = CoinSeriesRandomXKey(1790812800);
++    BOOST_CHECK(CoinSeriesRandomXHash(1, key, uint256::ONE, 0) != CoinSeriesRandomXHash(2, key, uint256::ONE, 0));
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validation.cpp b/src/validation.cpp
+index ea01646..ca987ca 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -3882,7 +3882,7 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
+ static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true)
+ {
+     // Check proof of work matches claimed amount
+-    if (fCheckPOW && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
++    if (fCheckPOW && !CheckProofOfWork(static_cast<const CBlockHeader&>(block), consensusParams))
+         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
+ 
+     return true;
+@@ -4075,7 +4075,7 @@ void ChainstateManager::GenerateCoinbaseCommitment(CBlock& block, const CBlockIn
+ bool HasValidProofOfWork(std::span<const CBlockHeader> headers, const Consensus::Params& consensusParams)
+ {
+     return std::ranges::all_of(headers,
+-                               [&](const auto& header) { return CheckProofOfWork(header.GetHash(), header.nBits, consensusParams); });
++                               [&](const auto& header) { return CheckProofOfWork(header, consensusParams); });
+ }
+ 
+ bool IsBlockMutated(const CBlock& block, bool check_witness_root)
+-- 
+2.43.0
+

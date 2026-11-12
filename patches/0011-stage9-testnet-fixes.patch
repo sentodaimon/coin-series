@@ -1,0 +1,342 @@
+From 5a9614b214b7334f2d2909f5cc9d9acd101db0e1 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <sentodaimon@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 15:46:03 +0900
+Subject: [PATCH 1/6] Coin Series whitepaper: RandomX version 1, start
+ difficulty, late-start rule
+
+---
+ doc/coinseries/whitepaper.md | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/doc/coinseries/whitepaper.md b/doc/coinseries/whitepaper.md
+index d4fb411..4d74a5d 100644
+--- a/doc/coinseries/whitepaper.md
++++ b/doc/coinseries/whitepaper.md
+@@ -102,7 +102,7 @@ Mining is done on ordinary computers, and one computation produces blocks on all
+ 
+ **Proof of work**
+ 
+-- RandomX is used. It is designed for general-purpose CPUs, so specialized hardware gains little advantage
++- RandomX (version 1, in use since 2019) is used. It is designed for general-purpose CPUs, so specialized hardware gains little advantage
+ - Why not Bitcoin's SHA-256: if a few holders of specialized miners joined, ordinary participants' mining would become meaningless, and the chain could be attacked simply by renting hash power
+ - For the same reason, merged mining with Bitcoin, which would let Bitcoin miners mine these chains at no extra cost, is not used
+ 
+@@ -117,7 +117,7 @@ Mining is done on ordinary computers, and one computation produces blocks on all
+ 
+ - Difficulty is adjusted every block. On chains with few participants, hash power can change sharply, and adjusting only every two weeks could leave blocks stalled for a long time
+ - If no block appears for a long time, a rule makes the difficulty progressively easier as time passes. The goal is for the next block to appear within a few hours even after large hash power arrives and then leaves. Returning to the normal 10-minute interval may take longer
+-- Parameters: difficulty halves or doubles over a 2-hour half-life of schedule deviation; if no block appears for more than 1 hour, the target becomes twice as easy every further 30 minutes; block times may be at most 10 minutes ahead of the current time. In simulation, after 1,000-fold hash power arrived for 48 hours and left, the next block appeared after about 4.5 hours (median). The starting difficulty is 〔set from measured hash rate before launch〕
++- Parameters: difficulty halves or doubles over a 2-hour half-life of schedule deviation; if no block appears for more than 1 hour, the target becomes twice as easy every further 30 minutes; block times may be at most 10 minutes ahead of the current time. In simulation, after 1,000-fold hash power arrived for 48 hours and left, the next block appeared after about 4.5 hours (median). The starting difficulty is 1,000,000 hashes per block, set from the launch desktop's measured hash rate (about 1,660 hashes per second, about 10-minute blocks). The schedule is counted from the first mined block, so a late start after the reference block does not release a burst of easy blocks
+ 
+ **Limitations**
+ 
+-- 
+2.43.0
+
+
+From 8acaa3920cd88ee9b24b10cb2dc677d682e59ae9 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <sentodaimon@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 17:16:54 +0900
+Subject: [PATCH 2/6] Windows: 64-bit file seek/tell in AutoFile (claim
+ snapshot is ~9 GB)
+
+---
+ src/streams.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/streams.cpp b/src/streams.cpp
+index e38b959..8c08e37 100644
+--- a/src/streams.cpp
++++ b/src/streams.cpp
+@@ -35,7 +35,13 @@ void AutoFile::seek(int64_t offset, int origin)
+     if (IsNull()) {
+         throw std::ios_base::failure("AutoFile::seek: file handle is nullptr");
+     }
++#ifdef WIN32
++    // Windows' fseek/ftell use a 32-bit long; the 64-bit variants are needed for files over 2 GiB
++    // (the Coin Series claim snapshot is about 9 GB).
++    if (_fseeki64(m_file, offset, origin) != 0) {
++#else
+     if (std::fseek(m_file, offset, origin) != 0) {
++#endif
+         throw std::ios_base::failure(feof() ? "AutoFile::seek: end of file" : "AutoFile::seek: fseek failed");
+     }
+     if (origin == SEEK_SET) {
+@@ -43,7 +49,11 @@ void AutoFile::seek(int64_t offset, int origin)
+     } else if (origin == SEEK_CUR && m_position.has_value()) {
+         *m_position += offset;
+     } else {
++#ifdef WIN32
++        int64_t r{_ftelli64(m_file)};
++#else
+         int64_t r{std::ftell(m_file)};
++#endif
+         if (r < 0) {
+             throw std::ios_base::failure("AutoFile::seek: ftell failed");
+         }
+-- 
+2.43.0
+
+
+From 22d7635084f4f0265716c9712d21774bbaabd5c2 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <sentodaimon@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 17:27:37 +0900
+Subject: [PATCH 3/6] Windows testnet kit: mining script creates wallets and
+ checks addresses
+
+---
+ .../coinseries/windows-testnet/t2-mine-testnet.bat   | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/contrib/coinseries/windows-testnet/t2-mine-testnet.bat b/contrib/coinseries/windows-testnet/t2-mine-testnet.bat
+index a048ff4..473da2e 100644
+--- a/contrib/coinseries/windows-testnet/t2-mine-testnet.bat
++++ b/contrib/coinseries/windows-testnet/t2-mine-testnet.bat
+@@ -2,14 +2,24 @@
+ cd /d "%~dp0"
+ call 00-settings.bat
+ for %%c in (half quarter dime nickel cent) do (
++  bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c -rpcwait createwallet w >nul 2>&1
++  bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c loadwallet w >nul 2>&1
+   if not exist "%DATA%\address-%%c.txt" bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c getnewaddress > "%DATA%\address-%%c.txt"
+ )
++for %%c in (half quarter dime nickel cent) do (
++  for %%s in ("%DATA%\address-%%c.txt") do if %%~zs LSS 10 (
++    del "%DATA%\address-%%c.txt"
++    echo Could not get a %%c address - are the nodes running? Run t1-start-testnet.bat first.
++    pause
++    exit /b 1
++  )
++)
+ set /p A_HALF=<"%DATA%\address-half.txt"
+ set /p A_QUARTER=<"%DATA%\address-quarter.txt"
+ set /p A_DIME=<"%DATA%\address-dime.txt"
+ set /p A_NICKEL=<"%DATA%\address-nickel.txt"
+ set /p A_CENT=<"%DATA%\address-cent.txt"
+ echo Mining all five testnet chains with %THREADS% threads. Close this window to stop mining.
+-echo Log: %DATA%\mining-log.txt
++echo Do not click inside this window (that pauses it). Log: %DATA%\mining-log.txt
+ cs-miner.exe --chain test --datadir "%DATA%" --threads %THREADS% --coin half=%A_HALF% --coin quarter=%A_QUARTER% --coin dime=%A_DIME% --coin nickel=%A_NICKEL% --coin cent=%A_CENT% >> "%DATA%\mining-log.txt" 2>&1
+ pause
+-- 
+2.43.0
+
+
+From 585a3add271b1c4837974d4d656d8aac8b73d246 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <sentodaimon@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 17:43:05 +0900
+Subject: [PATCH 4/6] Windows testnet kit: regenerate empty address files
+
+---
+ contrib/coinseries/windows-testnet/t2-mine-testnet.bat | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/contrib/coinseries/windows-testnet/t2-mine-testnet.bat b/contrib/coinseries/windows-testnet/t2-mine-testnet.bat
+index 473da2e..6f6ea38 100644
+--- a/contrib/coinseries/windows-testnet/t2-mine-testnet.bat
++++ b/contrib/coinseries/windows-testnet/t2-mine-testnet.bat
+@@ -4,6 +4,7 @@ call 00-settings.bat
+ for %%c in (half quarter dime nickel cent) do (
+   bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c -rpcwait createwallet w >nul 2>&1
+   bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c loadwallet w >nul 2>&1
++  if exist "%DATA%\address-%%c.txt" for %%s in ("%DATA%\address-%%c.txt") do if %%~zs LSS 10 del "%DATA%\address-%%c.txt"
+   if not exist "%DATA%\address-%%c.txt" bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%%c getnewaddress > "%DATA%\address-%%c.txt"
+ )
+ for %%c in (half quarter dime nickel cent) do (
+-- 
+2.43.0
+
+
+From 9f3b92d474982e9fefadabcdc53314dc3d75e2d0 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <sentodaimon@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 18:52:05 +0900
+Subject: [PATCH 5/6] Coin Series: shorten genesis coinbase text to
+ cs/<coin>/<env>/<H hash>
+
+"coin-series/quarter/<env>/<hash>" made the genesis coinbase scriptSig 101 bytes
+(limit 100), so the quarter chain rejected its own genesis (bad-cb-length) on
+the first 7-day testnet. Test: every coin and network derives a valid genesis
+from a real Bitcoin header.
+---
+ doc/coinseries/manual.md      |  2 +-
+ doc/coinseries/spec.md        |  4 ++--
+ src/kernel/chainparams.cpp    |  5 +++--
+ src/test/coinseries_tests.cpp | 18 +++++++++++++++++-
+ 4 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/doc/coinseries/manual.md b/doc/coinseries/manual.md
+index efea67b..f03c628 100644
+--- a/doc/coinseries/manual.md
++++ b/doc/coinseries/manual.md
+@@ -422,7 +422,7 @@ The genesis block is derived from the hash of a future Bitcoin block announced i
+ 1. Announce the launch reference Bitcoin block height H together with the software release. H is the Bitcoin height at release plus at least 432 blocks; about 72 hours on average, and the actual time may be shorter or longer
+ 2. H is recorded in the source as a consensus parameter. That block's hash cannot be known by anyone until the block is mined
+ 3. The genesis block is derived by a fixed formula from that hash
+-    - Coinbase text = `"coin-series/<chain name>/" || reference block hash`
++    - Coinbase text = `"cs/<chain name>/<environment>/" || reference block hash (hex)` (short prefix keeps the coinbase script within 100 bytes)
+     - Time = the reference block's timestamp
+     - Difficulty bits = starting target, reward 0, exempt from proof-of-work check
+ 4. At startup a node takes the reference block hash as input and computes the genesis of all five chains itself. Participants verify the value on their own Bitcoin node or several block explorers
+diff --git a/doc/coinseries/spec.md b/doc/coinseries/spec.md
+index c70f2f4..8b3c68e 100644
+--- a/doc/coinseries/spec.md
++++ b/doc/coinseries/spec.md
+@@ -126,9 +126,9 @@ The txid covers version, all inputs, all outputs and lock time; input amounts an
+ 
+ ## 10. Genesis (fair start)
+ 
+-- With the release, the Bitcoin height H **(undecided)** is announced (release height + at least 432 blocks).
++- With the release, the Bitcoin height H is announced (release height + at least 432 blocks). The first 7-day testnet uses H = 973949 (already mined; the testnet carries no value).
+ - Each node is started with `-beaconheader=<80-byte header of Bitcoin block H>`; on main and test the header must carry real Bitcoin proof of work (target ≤ 2^200).
+-- Genesis per chain and environment: coinbase text `coin-series/<name>/<env>/<hash of block H>`, output `OP_RETURN` with value 0, time = time of block H, bits = start bits, nonce 0. Genesis hash uses the 180-byte header.
++- Genesis per chain and environment: coinbase text `cs/<name>/<env>/<hash of block H, hex>` (short prefix: the coinbase script must stay within 100 bytes), output `OP_RETURN` with value 0, time = time of block H, bits = start bits, nonce 0. Genesis hash uses the 180-byte header.
+ - The genesis derived from the block H that remains in Bitcoin's final chain is canonical; blocks built on a replaced block H are invalid.
+ - Releases after mining starts hardcode the hash of block H.
+ 
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index e6aed76..c8df302 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -836,8 +836,9 @@ public:
+         const CScript genesis_script = CScript() << OP_RETURN;
+         if (beacon) {
+             // Genesis derived from Bitcoin block H (fixed formula, decided): coinbase text
+-            // "coin-series/<coin>/<environment>/<block H hash>", time = block H time, bits = start target, reward 0.
+-            const std::string genesis_msg = strprintf("coin-series/%s/%s/%s", std::string{info.name}, std::string{CoinEnvName(env)}, beacon->hash.GetHex());
++            // "cs/<coin>/<environment>/<block H hash>", time = block H time, bits = start target, reward 0.
++            // (Short prefix: the coinbase scriptSig must stay within 100 bytes; "coin-series/quarter/..." exceeded it.)
++            const std::string genesis_msg = strprintf("cs/%s/%s/%s", std::string{info.name}, std::string{CoinEnvName(env)}, beacon->hash.GetHex());
+             const uint32_t genesis_bits = consensus.nASERTStartBits ? consensus.nASERTStartBits : UintToArith256(consensus.powLimit).GetCompact();
+             genesis = CreateGenesisBlock(genesis_msg.c_str(), genesis_script, beacon->time, 0, genesis_bits, 1, /*genesisReward=*/0);
+         } else {
+diff --git a/src/test/coinseries_tests.cpp b/src/test/coinseries_tests.cpp
+index b52c5dc..4784dcb 100644
+--- a/src/test/coinseries_tests.cpp
++++ b/src/test/coinseries_tests.cpp
+@@ -30,6 +30,10 @@
+ 
+ #include <test/util/setup_common.h>
+ 
++#include <consensus/tx_check.h>
++#include <consensus/validation.h>
++#include <util/chaintype.h>
++
+ #include <boost/test/unit_test.hpp>
+ 
+ #include <algorithm>
+@@ -587,9 +591,21 @@ BOOST_AUTO_TEST_CASE(genesis_from_beacon_header)
+     BOOST_CHECK_EQUAL(half_a->GenesisBlock().nTime, 1800000000U);                                      // time = block H time
+     BOOST_CHECK_EQUAL(half_a->GenesisBlock().vtx[0]->GetValueOut(), 0);
+     const CScript& sig = half_a->GenesisBlock().vtx[0]->vin[0].scriptSig;
+-    const std::string expected_text = "coin-series/half/regtest/" + a_hash.GetHex();
++    const std::string expected_text = "cs/half/regtest/" + a_hash.GetHex();
+     BOOST_CHECK(std::search(sig.begin(), sig.end(), expected_text.begin(), expected_text.end()) != sig.end());
+ 
++    // Every coin and network derives a valid genesis coinbase (scriptSig within 100 bytes) from a real
++    // Bitcoin header (block 973949, used for the first 7-day testnet). "coin-series/quarter/..." once exceeded it.
++    const std::string real_h = "00c0de27d58b01d405ecac61dd54ee345255419583b3cf88979a00000000000000000000fa55c47cfa893204327b660672d0dac69a7b7f985a2883504978e892b6737d00359ee56aace5011782bc0de1";
++    for (const char* coin : {"half", "quarter", "dime", "nickel", "cent"}) {
++        for (ChainType chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST}) {
++            auto p = make(coin, chain, real_h);
++            TxValidationState st;
++            BOOST_CHECK_MESSAGE(CheckTransaction(*p->GenesisBlock().vtx[0], st), coin << " " << ChainTypeToString(chain) << " " << st.ToString());
++            BOOST_CHECK_EQUAL(p->GenesisBlock().nTime, 1793433141U);
++        }
++    }
++
+     // On the real networks the header must carry real Bitcoin proof of work.
+     BOOST_CHECK_THROW(make("half", ChainType::MAIN, a_hex), std::runtime_error);
+     BOOST_CHECK_THROW(make("half", ChainType::REGTEST, "00"), std::runtime_error);
+-- 
+2.43.0
+
+
+From b4f7aec1cce0c784f414de1b1bc9b91605117ea2 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <sentodaimon@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 18:52:29 +0900
+Subject: [PATCH 6/6] Windows testnet kit: one-click 7-day testnet start (H =
+ 973949)
+
+---
+ .../windows-testnet/00-settings.bat           | 18 ++++----
+ .../windows-testnet/start-7day-testnet.bat    | 42 +++++++++++++++++++
+ 2 files changed, 51 insertions(+), 9 deletions(-)
+ create mode 100644 contrib/coinseries/windows-testnet/start-7day-testnet.bat
+
+diff --git a/contrib/coinseries/windows-testnet/00-settings.bat b/contrib/coinseries/windows-testnet/00-settings.bat
+index 27b545a..cb19bde 100644
+--- a/contrib/coinseries/windows-testnet/00-settings.bat
++++ b/contrib/coinseries/windows-testnet/00-settings.bat
+@@ -1,12 +1,12 @@
+ @echo off
+-rem ===== Coin Series testnet settings (edit only this file) =====
+-rem Data folder: blocks, wallets and the snapshot live here (use a drive with 30 GB free)
+-set DATA=D:\CoinSeriesData
+-rem 80-byte header (160 hex characters) of the announced Bitcoin block H. Filled in on launch day.
+-set BEACON=
+-rem Address of another testnet node to connect to (example 1.2.3.4). Leave empty for the first node.
++rem ===== Coin Series 7-day testnet settings =====
++rem Data folder for the 7-day testnet (separate from the rehearsal in C:\CoinSeries\data)
++set DATA=C:\CoinSeries\testnet7b
++rem Bitcoin block H = height 973949 (000000000000000000008ccd8d61fc581bb25d1917939059edd7d7e2c10bb4f6)
++set BEACON=00c0de27d58b01d405ecac61dd54ee345255419583b3cf88979a00000000000000000000fa55c47cfa893204327b660672d0dac69a7b7f985a2883504978e892b6737d00359ee56aace5011782bc0de1
++rem Address of another testnet node to connect to (empty for the first node)
+ set SEED=
+-rem Mining threads (default: all CPU threads; lower it if the PC gets too hot or slow)
++rem Mining threads (default: all CPU threads)
+ set THREADS=%NUMBER_OF_PROCESSORS%
+-rem Development only: start without the snapshot. Normally leave empty.
+-set EXTRA=
++rem Use the already verified snapshot from the rehearsal folder (no 9 GB copy)
++set EXTRA=-claimsnapshot=C:\CoinSeries\data\snapshot\utxo-840000.dat
+diff --git a/contrib/coinseries/windows-testnet/start-7day-testnet.bat b/contrib/coinseries/windows-testnet/start-7day-testnet.bat
+new file mode 100644
+index 0000000..f0735a7
+--- /dev/null
++++ b/contrib/coinseries/windows-testnet/start-7day-testnet.bat
+@@ -0,0 +1,42 @@
++@echo off
++setlocal EnableDelayedExpansion
++cd /d "%~dp0"
++echo ==== Coin Series 7-day testnet: one-click start ====
++echo Do not click inside any black window (that pauses it).
++echo [1/4] Stopping earlier runs (C:\CoinSeries\data, C:\CoinSeries\testnet7) ...
++taskkill /im cs-miner.exe /f >nul 2>&1
++for %%c in (half quarter dime nickel cent) do bitcoin-cli.exe -datadir="C:\CoinSeries\data" -chain=test -coin=%%c stop >nul 2>&1
++for %%c in (half quarter dime nickel cent) do bitcoin-cli.exe -datadir="C:\CoinSeries\testnet7" -chain=test -coin=%%c stop >nul 2>&1
++timeout /t 20 /nobreak >nul
++call 00-settings.bat
++if not exist "%DATA%" mkdir "%DATA%"
++echo [2/4] Starting the five 7-day testnet nodes (snapshot check takes about 3 minutes) ...
++set OPT=-datadir="%DATA%" -chain=test -beaconheader=%BEACON%
++if not "%SEED%"=="" set OPT=%OPT% -addnode=%SEED%
++for %%c in (half quarter dime nickel cent) do start "testnet7 %%c" /min bitcoind.exe %OPT% -coin=%%c %EXTRA%
++echo [3/4] Waiting for each node, then creating wallets and addresses ...
++for %%c in (half quarter dime nickel cent) do call :ready %%c
++echo [4/4] Starting the miner in its own window. Log: %DATA%\mining-log.txt
++start "testnet7 miner" /min cmd /c t2-mine-testnet.bat
++echo All started. You can close THIS window. Keep the node and miner windows open.
++pause
++exit /b 0
++
++:ready
++set C=%1
++set /a TRIES=0
++:wait
++bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%C% getblockcount >nul 2>&1
++if errorlevel 1 (
++  set /a TRIES+=1
++  if !TRIES! GEQ 60 (
++    echo   %C% node did not start in 10 minutes - see %DATA%\%C%-testnet\debug.log
++    exit /b 1
++  )
++  timeout /t 10 /nobreak >nul
++  goto wait
++)
++bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%C% createwallet w >nul 2>&1
++bitcoin-cli.exe -datadir="%DATA%" -chain=test -coin=%C% loadwallet w >nul 2>&1
++echo   %C% node ready
++exit /b 0
+-- 
+2.43.0
+

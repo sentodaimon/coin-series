@@ -1,0 +1,152 @@
+From 3bc50b6d8bbc20c4dfe81c1cf8e196c92d084286 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <sentodaimon@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:57:37 +0900
+Subject: [PATCH 1/2] Coin Series: fix RandomX version 1 on main and test
+ (version 2 regtest only)
+
+---
+ doc/coinseries/manual.md   | 2 +-
+ doc/coinseries/spec.md     | 4 +---
+ src/chainparamsbase.cpp    | 2 +-
+ src/kernel/chainparams.cpp | 2 ++
+ 4 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/doc/coinseries/manual.md b/doc/coinseries/manual.md
+index d1dcf7d..efea67b 100644
+--- a/doc/coinseries/manual.md
++++ b/doc/coinseries/manual.md
+@@ -848,7 +848,7 @@ The consensus rules are fixed byte by byte in `doc/coinseries/spec.md` (consensu
+ | Stage | Contents | Status |
+ | --- | --- | --- |
+ | 1 | Five coins, reward schedule, per-chain money limit | Done |
+-| 2 | RandomX proof of work, five-chain merged mining (180-byte header) | Done (RandomX version 1 or 2 still to choose) |
++| 2 | RandomX proof of work, five-chain merged mining (180-byte header) | Done (RandomX version 1 decided) |
+ | 3 | Per-block difficulty (2-hour half-life), stall relief, 10-minute future limit | Done (start difficulty to be measured on the launch laptop) |
+ | 4 | Replay protection (chain identifier in every signature hash) | Done |
+ | 5 | Snapshot verification and claims (BIP-322 / legacy signed message) | Done (real 840,000 snapshot to be downloaded and verified) |
+diff --git a/doc/coinseries/spec.md b/doc/coinseries/spec.md
+index 3f2cefd..c23c6c7 100644
+--- a/doc/coinseries/spec.md
++++ b/doc/coinseries/spec.md
+@@ -47,7 +47,7 @@ Values marked **(placeholder)** are fixed before launch; values marked **(undeci
+ 2. Merge tree with 8 leaves. Leaf s holds the commitment of the chain whose merge slot is s; unused leaves are 32 zero bytes. Inner node = `SHA256d(left || right)`.
+ 3. A chain recomputes root `M` from its own commitment at its own slot and the three siblings in the header.
+ 4. RandomX key `K = SHA256("coin-series/randomx" || LE64(floor(nTime / 1209600)))` — a new key every 2 weeks, derived from the header time only.
+-5. `pow = RandomX_v(K, M || LE64(nNonce64))`, v = RandomX version **(undecided: 1 or 2; implementation supports both)**.
++5. `pow = RandomX_v(K, M || LE64(nNonce64))`, v = RandomX version **1** (decided; version 2 is available on regtest only, via `-randomxversion=2`).
+ 6. Valid if `target = Compact(nBits)` is positive, not overflowing, `≤ powLimit`, and `pow` (read as a little-endian 256-bit number) `≤ target`.
+ - The genesis block is fixed by hash and exempt from proof of work.
+ - A commitment placed in a different slot yields a different root; one solution can make at most one block per chain.
+@@ -139,6 +139,4 @@ The txid covers version, all inputs, all outputs and lock time; input amounts an
+ 
+ ## 12. Open items
+ 
+-- RandomX version 1 or 2.
+-- Start target and powLimit (measured on the launch laptop).
+ - Bitcoin reference height H.
+diff --git a/src/chainparamsbase.cpp b/src/chainparamsbase.cpp
+index 9faea11..0d421ed 100644
+--- a/src/chainparamsbase.cpp
++++ b/src/chainparamsbase.cpp
+@@ -20,7 +20,7 @@ void SetupChainParamsBaseOptions(ArgsManager& argsman)
+     argsman.AddArg("-claimsnapshothash=<hex>", "Coin Series regtest: serialized UTXO hash of a development claim snapshot", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+     argsman.AddArg("-allowmissingsnapshot", "Coin Series development: start main/test without the claim snapshot (claims impossible)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+     argsman.AddArg("-coinseriesasert", "Coin Series regtest: use the real difficulty rules (ASERT + stall relief) instead of fixed easiest difficulty (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+-    argsman.AddArg("-randomxversion=<n>", "Coin Series development: RandomX version for proof of work, 1 or 2 (default: 1). All nodes of a network must use the same value.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
++    argsman.AddArg("-randomxversion=<n>", "Coin Series regtest: RandomX version for proof of work, 1 or 2 (default: 1). Main and test always use version 1.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-coin=<coin>", "Coin Series: run the chain of <coin>. Allowed values: " LIST_COIN_NAMES ". Combine with -chain=main, test or regtest. Without -coin the software runs original Bitcoin (for regression testing only).", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-chain=<chain>", "Use the chain <chain> (default: main). Allowed values: " LIST_CHAIN_NAMES, ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-regtest", "Enter regression test mode, which uses a special chain in which blocks can be solved instantly. "
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index 3531c02..5d3b61f 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -879,6 +879,8 @@ public:
+ std::unique_ptr<const CChainParams> CChainParams::CoinSeries(CoinSeriesId coin, ChainType chain, const RegTestOptions& regtest_options, int randomx_version, std::optional<CoinSeriesBeacon> beacon)
+ {
+     if (randomx_version != 1 && randomx_version != 2) throw std::runtime_error("RandomX version must be 1 or 2");
++    // Decided: RandomX version 1 (in use since 2019, launch difficulty measured with it). Version 2 stays for regtest experiments only.
++    if (chain != ChainType::REGTEST && randomx_version != 1) throw std::runtime_error("Main and test networks use RandomX version 1; -randomxversion=2 is for regtest only");
+     const CoinInfo* info = GetCoinInfo(coin);
+     const auto env = CoinEnvFromChainType(chain);
+     if (!info || !env) {
+-- 
+2.43.0
+
+
+From 10a87e9c8066080c716fd793cd634ed98b3c3a86 Mon Sep 17 00:00:00 2001
+From: Sento Daimon <sentodaimon@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 15:36:48 +0900
+Subject: [PATCH 2/2] Coin Series: start difficulty from the launch desktop
+ (1,000,000 hashes per block)
+
+---
+ contrib/coinseries/windows-testnet/00-settings.bat        | 4 ++--
+ .../\354\202\254\354\232\251\353\262\225.txt"             | 2 +-
+ doc/coinseries/spec.md                                    | 2 +-
+ src/kernel/chainparams.cpp                                | 8 ++++----
+ 4 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/contrib/coinseries/windows-testnet/00-settings.bat b/contrib/coinseries/windows-testnet/00-settings.bat
+index 27927eb..27b545a 100644
+--- a/contrib/coinseries/windows-testnet/00-settings.bat
++++ b/contrib/coinseries/windows-testnet/00-settings.bat
+@@ -6,7 +6,7 @@ rem 80-byte header (160 hex characters) of the announced Bitcoin block H. Filled
+ set BEACON=
+ rem Address of another testnet node to connect to (example 1.2.3.4). Leave empty for the first node.
+ set SEED=
+-rem Mining threads (this PC has 4; use 2 if it gets too hot or slow)
+-set THREADS=4
++rem Mining threads (default: all CPU threads; lower it if the PC gets too hot or slow)
++set THREADS=%NUMBER_OF_PROCESSORS%
+ rem Development only: start without the snapshot. Normally leave empty.
+ set EXTRA=
+diff --git "a/contrib/coinseries/windows-testnet/\354\202\254\354\232\251\353\262\225.txt" "b/contrib/coinseries/windows-testnet/\354\202\254\354\232\251\353\262\225.txt"
+index 9a14afe..594602f 100644
+--- "a/contrib/coinseries/windows-testnet/\354\202\254\354\232\251\353\262\225.txt"
++++ "b/contrib/coinseries/windows-testnet/\354\202\254\354\232\251\353\262\225.txt"
+@@ -8,7 +8,7 @@
+    - DATA     : 데이터 폴더 (기본 D:\CoinSeriesData, 여유 30GB 이상)
+    - BEACON   : 비트코인 블록 H의 머리 값 (출시일에 공지되는 160자리 값)
+    - SEED     : 연결할 다른 시험망 노드 주소 (첫 노드는 비워 둠)
+-   - THREADS  : 채굴 스레드 수 (이 PC 4, 뜨겁거나 느리면 2)
++   - THREADS  : 채굴 스레드 수 (기본 전체, 뜨겁거나 느리면 줄이기)
+ 2. 스냅샷 파일 utxo-840000.dat 를 DATA 폴더 안 snapshot 폴더에 넣기
+ 
+ 실행 순서
+diff --git a/doc/coinseries/spec.md b/doc/coinseries/spec.md
+index c23c6c7..c70f2f4 100644
+--- a/doc/coinseries/spec.md
++++ b/doc/coinseries/spec.md
+@@ -55,7 +55,7 @@ Values marked **(placeholder)** are fixed before launch; values marked **(undeci
+ 
+ ## 5. Difficulty
+ 
+-Parameters: spacing T = 600 s, half-life τ = 7,200 s, relief start R = 3,600 s, relief doubling D = 1,800 s, start bits 0x1f01179e (60,000 hashes per block; measured 105.7 H/s on the launch PC, a Ryzen 3 3200U with 4 threads, gives about 9.5-minute blocks), powLimit = start × 4,096 = 0x1179e0… (about 15 hashes per block).
++Parameters: spacing T = 600 s, half-life τ = 7,200 s, relief start R = 3,600 s, relief doubling D = 1,800 s, start bits 0x1e10c6f7 (1,000,000 hashes per block; measured 1,658 H/s on the launch desktop with all threads, RandomX version 1 fast mode, gives about 10-minute blocks), powLimit = start × 4,096 = 0x010c6f70… (about 244 hashes per block).
+ 
+ For a new block at height h with parent p (height h−1) and genesis g:
+ 
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index 5d3b61f..e6aed76 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -774,11 +774,11 @@ public:
+                 consensus.nMaxFutureBlockTime = 2 * 60 * 60;
+             }
+         } else {
+-            // Starting target: 60,000 hashes per block, from the launch PC measurement (Ryzen 3 3200U,
+-            // 4 threads, RandomX fast mode: 105.7 H/s -> about 9.5-minute blocks). Limit = start x 4096 (~15 hashes per block).
+-            consensus.powLimit = uint256{"1179e00000000000000000000000000000000000000000000000000000000000"};
++            // Starting target: 1,000,000 hashes per block, from the launch desktop measurement (RandomX v1 fast mode,
++            // all threads 1,658 H/s -> about 10-minute blocks). Limit = start x 4096 (~244 hashes per block).
++            consensus.powLimit = uint256{"010c6f7000000000000000000000000000000000000000000000000000000000"};
+             consensus.nASERTHalfLife = 2 * 60 * 60;
+-            consensus.nASERTStartBits = 0x1f01179e;
++            consensus.nASERTStartBits = 0x1e10c6f7;
+             consensus.fPowNoRetargeting = false;
+         }
+ 
+-- 
+2.43.0
+
