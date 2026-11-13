@@ -79,9 +79,10 @@ Sento Daimon (pen name). The issuer mines like everyone else; its mining reward 
    - Torrent: `magnet:?xt=urn:btih:596c26cc709e213fdfec997183ff67067241440c&dn=utxo-840000.dat&tr=udp%3A%2F%2Ftracker.bitcoin.sprovoost.nl%3A6969`
    - Or direct download: `https://lopp.net/download/utxo-snapshot-height-840000.dat` (rename it to `utxo-840000.dat`).
    - The source does not matter: the node computes the snapshot's UTXO hash and starts only if it equals the value fixed in Bitcoin Core (`a2a5521b…8f96`).
+   - Other location or file name (for example a drive with more space): edit the `DATA` and `SNAPSHOT` lines in `m0-settings.bat`. All m-scripts read `DATA` from there. Keep at least 25 GB free on that drive.
    - Or extract it yourself from a synced Bitcoin Core node: `bitcoin-cli -rpcclienttimeout=0 -named dumptxoutset utxo-840000.dat rollback=840000`.
-3. Run `m1-start-mainnet.bat`. It checks the header of Bitcoin block 974800, starts the five nodes, connects to `coinseries.duckdns.org` (set in `m0-settings.bat`), waits until the chain is downloaded and starts mining with all CPU threads. The first start verifies the snapshot and takes a few minutes.
-4. After it has started, run `m2-protect-wallets.bat` to set a wallet password and save backups.
+3. Run `m1-start-mainnet.bat`. It checks the header of Bitcoin block 974800, starts the five nodes, connects to `coinseries.duckdns.org` (set in `m0-settings.bat`), waits until the chain is downloaded and starts mining with all CPU threads. The first start verifies the snapshot (about 10 minutes on a laptop).
+4. After it has started, run `m2-protect-wallets.bat` to set a wallet password and save backups (to the `DATA` folder name plus `-backup`, by default `C:\CoinSeries\mainnet-backup`).
 5. `m3-status.bat` shows heights, connections and balances; `m4-stop-mainnet.bat` stops everything.
 6. Optional: open TCP ports 21302, 21304, 21310, 21320 and 21400 on your router so that other nodes can connect to you.
 
