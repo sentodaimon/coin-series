@@ -16,6 +16,7 @@ Five independent chains with Bitcoin's transaction system and a supply multiplie
 
 - Launched 2026-11-06. Bitcoin block 974800 (hash `00000000000000000000604cc2a86a91a1cb07c387f57f70efbc4a861a74dd23`) was found at 10:25 UTC; the first Coin Series blocks followed at 10:33 UTC.
 - Anyone can join and mine. There is no permission, registration or fee.
+- Announcement and discussion: https://bitcointalk.org/index.php?topic=5599778.0
 
 ## Join the network
 
