@@ -1,6 +1,7 @@
 @echo off
 cd /d "%~dp0"
-set D=C:\CoinSeries\mainnet
+call m0-settings.bat
+set D=%DATA%
 set OUT=%D%\status.txt
 echo Coin Series mainnet status %DATE% %TIME% > "%OUT%"
 for %%c in (half quarter dime nickel cent) do (

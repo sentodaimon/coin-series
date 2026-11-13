@@ -1,5 +1,6 @@
 ﻿Set-Location $PSScriptRoot
-$DATA = "C:\CoinSeries\mainnet"; $BK = "C:\CoinSeries\mainnet-backup"
+$s = @{}; Get-Content .\m0-settings.bat | Where-Object { $_ -match '^set (\w+)=(.*)$' } | ForEach-Object { $null = $_ -match '^set (\w+)=(.*)$'; $s[$Matches[1]] = $Matches[2].Trim() }
+$DATA = $s.DATA; $BK = "$DATA-backup"
 New-Item -ItemType Directory -Force $BK | Out-Null
 $p1 = Read-Host "Wallet password" -AsSecureString
 $p2 = Read-Host "Same password again" -AsSecureString
@@ -13,4 +14,4 @@ foreach ($c in "half","quarter","dime","nickel","cent") {
   if (Test-Path "$BK\$c-wallet.dat") { Write-Host "$c : backup saved" } else { Write-Host "$c : BACKUP FAILED" }
 }
 $a = $null; $b = $null
-Write-Host "Done. Copy the folder C:\CoinSeries\mainnet-backup to a USB stick and keep it with the password paper."
+Write-Host "Done. Copy the folder $BK to a USB stick and keep it with the password paper."
