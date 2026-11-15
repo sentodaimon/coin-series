@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coin Series mainnet status</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#555; --line:#bbb; --head:#f2f2f2; --ok:#1d6b2f; --warn:#a15c00; }
+  body { margin:0; font:15px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; color:var(--fg); background:#fff; }
+  main { max-width:960px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  h2 { font-size:17px; margin:28px 0 8px; }
+  .sub { color:var(--muted); margin:0 0 16px; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  th, td { padding:6px 8px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
+  th { background:var(--head); font-weight:600; }
+  th:first-child, td:first-child { text-align:left; }
+  td.addr { font-family:ui-monospace, Consolas, monospace; font-size:13px; text-align:left; }
+  .wrap { overflow-x:auto; }
+  .note { color:var(--muted); font-size:13px; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); }
+  a { color:#0b57d0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Bitcoin Coin Series — mainnet status</h1>
+  <p class="sub">Read from the public node every 10 minutes. <span id="upd">Loading…</span></p>
+
+  <div class="wrap"><table id="coins">
+    <thead><tr><th>Coin</th><th>Height</th><th>Last block</th><th>Difficulty</th><th>Network hash rate</th><th>Mined supply</th><th>Inbound peers</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+  <p class="note">All five chains are mined together (merged mining), so heights normally match. Mined supply counts block rewards only; claims by Bitcoin holders are not included.</p>
+
+  <h2>Who mined the last blocks</h2>
+  <p id="share">–</p>
+
+  <h2>Recent blocks (Half)</h2>
+  <div class="wrap"><table id="blocks">
+    <thead><tr><th>Height</th><th>Time (UTC)</th><th>Interval</th><th>Miner</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+
+  <h2>Join</h2>
+  <p>Public node: <code>coinseries.duckdns.org</code> (ports 21302, 21304, 21310, 21320, 21400).
+     Windows kit, source patches and documents: <a href="https://github.com/sentodaimon/coin-series">github.com/sentodaimon/coin-series</a>.
+     Discussion: <a href="https://bitcointalk.org/index.php?topic=5599778.0">bitcointalk</a>.</p>
+  <p class="note">An experiment. The coins have no promised value and nothing is sold by the issuer.</p>
+</main>
+<script>
+const GIST = "06efd4c6fed71f43a3410e022ae96ff2";
+const URL_ = "https://gist.githubusercontent.com/sentodaimon/" + GIST + "/raw/coinseries-status.json";
+const NAMES = { half:["Half","BTCH",2], quarter:["Quarter","BTCQ",4], dime:["Dime","BTCD",10], nickel:["Nickel","BTCN",20], cent:["Cent","BTCC",100] };
+const fmt = (n, d=0) => n == null ? "–" : Number(n).toLocaleString("en-US", { maximumFractionDigits:d, minimumFractionDigits:d });
+function ago(sec) {
+  const s = Math.max(0, Math.round(Date.now()/1000 - sec));
+  if (s < 90) return s + " s ago";
+  if (s < 5400) return Math.round(s/60) + " min ago";
+  if (s < 172800) return (s/3600).toFixed(1) + " h ago";
+  return Math.round(s/86400) + " days ago";
+}
+function utc(sec) { return new Date(sec*1000).toISOString().replace("T"," ").slice(0,16); }
+function supply(height, mult) {
+  // Bitcoin schedule from height 840,000 (3.125 BTC), halving every 210,000 blocks; block 0 pays nothing.
+  let total = 0, h = 1, reward = 3.125 * mult;
+  while (h <= height && reward > 1e-8) {
+    const end = Math.min(height, 210000 * Math.floor((h - 1) / 210000 + 1));
+    total += (end - h + 1) * reward; h = end + 1; reward /= 2;
+  }
+  return total;
+}
+async function load() {
+  try {
+    const r = await fetch(URL_ + "?t=" + Date.now(), { cache:"no-store" });
+    const d = await r.json();
+    const age = Date.now()/1000 - d.updated;
+    document.getElementById("upd").innerHTML = "Updated " + ago(d.updated) + "." + (age > 3600 ? ' <span class="warn">The status has not been updated for over an hour; the public node may be offline.</span>' : "");
+    document.querySelector("#coins tbody").innerHTML = d.coins.map(c => {
+      const n = NAMES[c.coin];
+      const late = Date.now()/1000 - c.tip_time > 3600;
+      return `<tr><td>${n[0]} (${n[1]}, x${n[2]})</td><td>${fmt(c.height)}</td><td class="${late?"warn":""}">${ago(c.tip_time)}</td>`
+        + `<td>${fmt(c.difficulty, 4)}</td><td>${c.hashps==null?"–":fmt(c.hashps)+" H/s"}</td><td>${fmt(supply(c.height, n[2]), 2)} ${n[1]}</td><td>${fmt(c.peers_in)}</td></tr>`;
+    }).join("");
+    const s = d.share;
+    const other = s.window - s.issuer;
+    document.getElementById("share").innerHTML = `Last ${s.window} blocks: issuer ${s.issuer}, other miners <b class="${other>0?"ok":""}">${other}</b>.`
+      + (other === 0 ? " So far only the issuer is mining. Every new miner makes the chain less dependent on one person." : "")
+      + (s.miners ? '<br><span class="note">By reward address (one miner may use several addresses):</span><br>' + s.miners.map(m => `<code>${m.miner}</code> ${m.blocks}`).join("<br>") : "");
+    const b = d.blocks;
+    document.querySelector("#blocks tbody").innerHTML = b.map((x, i) => {
+      const iv = i + 1 < b.length ? Math.round((x.time - b[i+1].time) / 60) + " min" : "–";
+      const m = x.miner === "issuer" ? "issuer" : x.miner;
+      return `<tr><td>${fmt(x.height)}</td><td>${utc(x.time)}</td><td>${iv}</td><td class="addr">${m}</td></tr>`;
+    }).join("");
+  } catch (e) {
+    document.getElementById("upd").textContent = "Status data could not be loaded right now.";
+  }
+}
+load(); setInterval(load, 60000);
+</script>
+</body>
+</html>
