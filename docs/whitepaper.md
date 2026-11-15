@@ -1,8 +1,8 @@
 # Bitcoin Coin Series — Whitepaper
 
-October 7, 2026
+Revised November 16, 2026 (first edition October 7, 2026)
 
-Draft. Contents may change until design verification and the public testnet are complete. Items in 〔 〕 will be finalized before launch.
+The mainnet launched on November 6, 2026. This revision fills in the items left open in the first edition (reference block, issuer addresses, distribution channels, supported claim range) and adds facts from after the launch. The consensus rules have not changed since the first edition.
 
 This project is an independent experiment with no official affiliation with Bitcoin (BTC), the Bitcoin Core developers, or any Bitcoin-related organization.
 
@@ -93,8 +93,8 @@ Anyone who held bitcoin at Bitcoin block 840,000 (the fourth halving block, Apri
 - No claim will ever ask you to enter a private key or recovery phrase on a website. Any such site is an impersonation
 - Claims are public. Anyone can see which bitcoin owner received coins at which new address
 - Bitcoin held on an exchange cannot be claimed directly by the user, because the exchange holds the private keys
-- Some special forms of bitcoin holdings may not be claimable at first. Even then, the record of what is claimable is preserved. Adding support later is a goal but cannot be guaranteed, since new rules apply only if node operators adopt them. Supported range: 〔to be finalized before launch〕
-- For safety, consider moving the bitcoin in question to a new address before claiming
+- Supported range: the four ordinary address types (legacy 1..., wrapped SegWit 3..., SegWit bc1q..., Taproot bc1p...) have been tested end to end with real nodes. Multisig and other special forms have not been tested yet; the record of what is claimable is preserved for them. Adding support later is a goal but cannot be guaranteed, since any new rules apply only if node operators adopt them
+- Prefer methods that keep the private key inside your wallet (message signing or PSBT signing). If you must handle a private key directly, move the bitcoin to a new address first
 
 ## 5. Mining
 
@@ -132,7 +132,7 @@ The chains launch after verification on a public testnet, and the launch conditi
 
 - The first block (genesis) of each of the five chains is derived from a future Bitcoin block announced in advance
 - No one in the world can know that Bitcoin block's contents until it is mined, so no one, including the issuer, can mine in advance
-- Reference block height: 〔announced with the release; at least 432 blocks after the release height, about 72 hours on average〕
+- Reference block: Bitcoin block 974,800 (hash 00000000000000000000604cc2a86a91a1cb07c387f57f70efbc4a861a74dd23). It was 547 blocks after the height at publication (974,253 on November 2, 2026) and was found at 10:25 UTC on November 6. The first mined blocks of all five chains followed at 10:33 UTC
 - The software is published beforehand. Once the reference block appears, participants can verify its value themselves and start immediately. Block propagation still introduces differences of seconds to tens of seconds. If the reference block is replaced by a Bitcoin reorganization, the replacing block becomes the reference, and blocks mined before that become invalid
 
 **On the issuer's share of mining**
@@ -145,15 +145,15 @@ In the early period there may be few or no miners, so the issuer's share of mini
 
 | Chain | Issuer's mining reward address |
 | --- | --- |
-| Half | 〔to be listed before launch〕 |
-| Quarter | 〔to be listed before launch〕 |
-| Dime | 〔to be listed before launch〕 |
-| Nickel | 〔to be listed before launch〕 |
-| Cent | 〔to be listed before launch〕 |
+| Half | hf1qehjpwg78vpeenph2c007up5jletumup5cja4rd |
+| Quarter | qt1q9g0yvmdm5nppuxdnu3432enscgmkd80355h3tm |
+| Dime | dm1qls7vqs4vd3l46245yrcak36xt5qfzqd50z8wst |
+| Nickel | nk1qjhuh7pus4anfd7k40lpdf9q8znjykdc5rs4vry |
+| Cent | ct1qq7stl076rkh9ayp5lk58cratx4xf9gyvu8n06l |
 
 **Testnet and mainnet**
 
-- Defect testing happens on a public testnet whose coins have no value, run for at least 7 days with the same start procedure as mainnet. The testnet may be restarted from scratch at any time
+- Defect testing happens on a public testnet whose coins have no value, run for at least 7 days with the same start procedure as mainnet. The 7-day testnet before launch (reference Bitcoin block 973,949) showed an average block interval of about 10 minutes, simultaneous mining of all five chains, claim lookup and rejection, and second-node sync. The testnet may be restarted from scratch at any time
 - The mainnet will not be restarted. Defects found on mainnet are fixed through rule improvements
 - The issuer has no power to fix particular blocks or reverse transactions
 
@@ -178,7 +178,7 @@ This project does not guarantee the price of any of the five coins, and a price 
 **The issuer's holdings**
 
 - The issuer obtains coins only through mining and claims, the same ways as any other participant
-- Early on, few people will claim, so most circulating coins will be mined coins, and the issuer may hold most of them. Coins mined to the addresses published in Section 6 can be verified
+- Early on, few people will claim, so most circulating coins will be mined coins, and the issuer may hold most of them. Coins mined to the addresses published in Section 6 can be verified. The roughly 900 blocks before external miners joined (about 5,600 Half) were mined by the issuer
 
 ## 8. How to Participate
 
@@ -186,14 +186,17 @@ Anyone can run a node, mine and claim without permission.
 
 **Distribution channels**
 
-- Official repository: 〔to be listed before launch〕
-- Torrent: 〔to be listed before launch〕
-- Every release file comes with a hash and the issuer's signature. Issuer signing key: 〔to be listed before launch〕
+- Official repository: https://github.com/sentodaimon/coin-series (source patches, Windows kit, documents, claim tools)
+- Official announcements: the sentodaimon account on bitcointalk.org, Altcoin Announcements (https://bitcointalk.org/index.php?topic=5599778.0)
+- Live status: https://sentodaimon.github.io/coin-series/
+- Snapshot: the Bitcoin Core snapshot of block 840,000 is used as is. Torrent and direct download links are in the repository README; however it is obtained, the node checks it against the verification value
+- No issuer signing key has been introduced yet. If one is introduced, it will be announced through the repository and the announcement thread. Until then, these two are the only official channels
 - Releases from any other source are not from the issuer
 
 **Running a node**
 
-- Binaries are provided for Windows and Linux. You can also build from source
+- A Windows kit with binaries is provided. On Linux and other systems, build Bitcoin Core v31.1 with the published patches
+- Public node: coinseries.duckdns.org (ports 21302 Half, 21304 Quarter, 21310 Dime, 21320 Nickel, 21400 Cent)
 - A node must download the Bitcoin snapshot (about 10 GB) once. The five chains share one file
 - The snapshot can also be extracted directly from a Bitcoin full node. However it is obtained, the node checks it against the verification value
 - You may run all five chains or only some of them
@@ -206,19 +209,29 @@ Anyone can run a node, mine and claim without permission.
 
 **Claiming**
 
-- Enter the bitcoin holdings you want to claim and your receiving addresses into the claim tool, and it will show a message to sign
-- Sign that message with the Bitcoin wallet you normally use and paste the signature into the tool to create the claim transactions. Your private key never leaves your wallet
-- For wallets that do not support message signing, the tool can also sign directly. In that case, use it on a computer disconnected from the internet, and move your bitcoin to a new address beforehand
+- Give the node the bitcoin outputs to claim (transaction id and output number) and a receiving address; it returns the claim transaction and the message to sign
+- Legacy addresses (1...) can sign the message with an ordinary wallet's message signing
+- Every address type can also sign as a PSBT: the claim helper (tools/cs_claim_psbt.py) turns the message into a PSBT that your wallet signs like an ordinary transaction. The PSBT spends only a zero-value virtual output that exists inside the proof, so it cannot move bitcoin
+- Attach the signature to complete the claim transaction. Your private key never leaves your wallet. Each coin has its own message, so you sign five times
+- Step-by-step guide: docs/claim-guide.md in the repository
 - Fees can be paid out of the claimed amount, so you can claim even if you hold no coins yet
 
-## 9. Risk Disclosure
+## 9. Status After Launch (as of November 16, 2026)
+
+- After the reference block appeared on November 6, 2026, the issuer started mining with the published software. Until November 13 the issuer mined the roughly 900 blocks alone
+- External miners joined about 20 minutes after the bitcointalk announcement on November 13. Hash rate rose by a factor of tens; the difficulty adjustment brought block intervals back to about 10 minutes within a day. There were no reorganizations
+- Last 100 blocks as of November 15: 58, 34 and 3 blocks from three external addresses, 5 from the issuer. One address has a majority, which is a concentration risk (see Section 10)
+- Live status (height, hash rate, share by mining address): https://sentodaimon.github.io/coin-series/
+- Claims: tested end to end with real nodes for four address types on all five coins, all successful. No claim has been made on mainnet yet
+
+## 10. Risk Disclosure
 
 The five coins may have no value, and any losses from participation are borne by the participant.
 
 | Risk | Description |
 | --- | --- |
 | Value | A price may not form or may fall far below the reference ratio. Most past Bitcoin forks disappeared |
-| Concentration | Early on, the issuer may hold most of the circulating coins |
+| Concentration | Early on, the issuer may hold most of the circulating coins. Hash power may also be concentrated in a few miners (as of November 2026, one address has a majority) |
 | Mining attacks | While participation is low, a third party with rented hash power could reverse recent transactions |
 | Stalls | Sudden changes in hash power may leave blocks absent for hours |
 | Software defects | New software that changes several Bitcoin rules at once. It is tested and reviewed, but freedom from defects cannot be guaranteed |
@@ -228,7 +241,7 @@ The five coins may have no value, and any losses from participation are borne by
 | Privacy | Claiming publicly links a bitcoin address to a new address |
 | Regulation | Virtual asset regulations and taxes in each country may apply. Compliance is the participant's own responsibility |
 
-## 10. Operating Principles and Disclaimer
+## 11. Operating Principles and Disclaimer
 
 The issuer commits to the following principles.
 
@@ -236,7 +249,7 @@ The issuer commits to the following principles.
 2. No sale of coins, no investment solicitation, and no promise of price or return
 3. No pursuit of exchange listings
 4. No custody of anyone else's coins or private keys
-5. No request to submit private keys or recovery phrases to the issuer or any website. Entering them into the offline claim tool on your own computer is different, and those values are never transmitted
+5. No request to enter private keys or recovery phrases into the issuer's hands, any website or any tool. Claims work by signing in your own wallet
 6. All source code is published, and the issuer's mining addresses are published
 7. The mainnet will not be restarted, and there will be no power to fix particular blocks or reverse transactions
 8. Consensus rule changes are announced in advance with an activation point. Each node operator decides whether to follow new rules
@@ -244,7 +257,7 @@ The issuer commits to the following principles.
 **Issuer**
 
 - Pseudonym: Sento Daimon
-- All announcements and release files are signed with a single signing key. Announcements without this signature are not from the issuer
+- The official channels are the GitHub repository and the bitcointalk thread in Section 8. If a signing key is introduced, it will be announced through these channels
 
 **Disclaimer**
 
