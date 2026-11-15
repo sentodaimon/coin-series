@@ -17,6 +17,7 @@ Five independent chains with Bitcoin's transaction system and a supply multiplie
 - Launched 2026-11-06. Bitcoin block 974800 (hash `00000000000000000000604cc2a86a91a1cb07c387f57f70efbc4a861a74dd23`) was found at 10:25 UTC; the first Coin Series blocks followed at 10:33 UTC.
 - Anyone can join and mine. There is no permission, registration or fee.
 - Announcement and discussion: https://bitcointalk.org/index.php?topic=5599778.0
+- Live status (height, hash rate, who mined the last blocks): https://sentodaimon.github.io/coin-series/
 
 ## Join the network
 
@@ -46,7 +47,7 @@ Public node (all five chains on one host):
 - Block every 10 minutes, difficulty adjusted every block, stall relief after 1 hour without a block.
 - Start difficulty: 1,000,000 hashes per block.
 - Rewards continue Bitcoin's schedule from height 840,000, times the multiplier.
-- Bitcoin holders at block 840,000 can claim the multiplied amount with their own keys (BIP-322 or legacy signed message). Claims never move bitcoin.
+- Bitcoin holders at block 840,000 can claim the multiplied amount with their own keys (BIP-322, legacy signed message, or a PSBT signed in any ordinary wallet). Claims never move bitcoin. Step by step: `docs/claim-guide.md`.
 - Signatures carry a chain identifier: transactions cannot be replayed between chains or to Bitcoin.
 
 Full specification: `docs/spec.md`. Whitepaper: `docs/whitepaper.md` (Korean: `docs/whitepaper-ko.md`). Manual: `docs/manual.md`.
