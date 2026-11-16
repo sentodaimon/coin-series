@@ -32,6 +32,7 @@ Public node (all five chains on one host):
 | Cent | `coinseries.duckdns.org:21400` |
 
 - Windows kit: `m0-settings.bat` already has `SEED=coinseries.duckdns.org`; each chain connects on its own port.
+- Linux: build and mine with `docs/build-linux.md`. Using the wallets (balance, send, backup, restore): `docs/wallet-guide.md`.
 - A node that is already running: `bitcoin-cli -datadir=C:\CoinSeries\mainnet -chain=main -coin=half addnode coinseries.duckdns.org:21302 add` (repeat for each coin with its port).
 - If you can, open the same TCP ports on your own router so that others can connect to you too.
 
