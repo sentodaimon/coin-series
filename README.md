@@ -18,6 +18,8 @@ Five independent chains with Bitcoin's transaction system and a supply multiplie
 - Anyone can join and mine. There is no permission, registration or fee.
 - Announcement and discussion: https://bitcointalk.org/index.php?topic=5599778.0
 - Live status (height, hash rate, who mined the last blocks): https://sentodaimon.github.io/coin-series/
+- Windows kit download: https://github.com/sentodaimon/coin-series/releases/tag/v1.0
+- Design write-up (merged mining, difficulty, claims, launch): https://dev.to/sentodaimon/merged-mining-five-bitcoin-core-forks-with-one-randomx-hash-what-i-built-and-what-happened-at-464o
 
 ## Join the network
 
@@ -77,7 +79,7 @@ Sento Daimon (pen name). The issuer mines like everyone else; its mining reward 
 
 ## Windows quick start
 
-1. Download this repository (Code -> Download ZIP) and copy its `windows` folder to `C:\CoinSeries\` (any folder works).
+1. Download the Windows kit `coin-series-windows-kit-v1.0.zip` from the [v1.0 release](https://github.com/sentodaimon/coin-series/releases/tag/v1.0) (SHA-256 sums on the release page) and unzip it to `C:\CoinSeries\` (any folder works). It contains the same files as the `windows` folder of this repository.
 2. Download the claim snapshot `utxo-840000.dat` (Bitcoin Core UTXO snapshot of block 840,000, about 9.8 GB) and put it in `C:\CoinSeries\snapshot\`.
    - Torrent: `magnet:?xt=urn:btih:596c26cc709e213fdfec997183ff67067241440c&dn=utxo-840000.dat&tr=udp%3A%2F%2Ftracker.bitcoin.sprovoost.nl%3A6969`
    - Or direct download: `https://lopp.net/download/utxo-snapshot-height-840000.dat` (rename it to `utxo-840000.dat`).
